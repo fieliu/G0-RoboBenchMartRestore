@@ -1,0 +1,59 @@
+# @package _global_
+
+defaults:
+  - override /data: r1lite/arm_torso_velocity_chassis
+  - override /model: vla/g0plus
+
+model:
+  pretrained_ckpt: /TO/Your/Path/G0Plus_260202
+  use_pretrained_norm_stats: True
+  learning_rate: 5e-4
+  weight_decay: 1e-2
+  max_epochs: 8
+  grad_accumulation_steps: 2
+  warmup_steps: 500
+  lr_scheduler_type: "cosine"
+
+data:
+  dataset:
+    dataset_dirs:
+      - /TO/Your/Path/BENCH_Pick_And_Place_20_Items16_Evenly_Distributed_Round_13_20251022_018
+      - /TO/Your/Path/BENCH_Pick_And_Place_20_Items57_Evenly_Distributed_Round_13_20251024_018
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  init_lora_weights: true
+  vlm_lr_multiplier: 0.5
+
+  target_modules:
+    # === Vision Tower (Siglip) ===
+    # SiglipAttention: q_proj, k_proj, v_proj, out_proj
+    - q_proj
+    - k_proj
+    - v_proj
+    - out_proj
+    # SiglipMLP: fc1, fc2
+    - fc1
+    - fc2
+    # === Multi-modal Projector ===
+    - linear
+    # === VLM Mixture (Gemma) & Action Mixture ===
+    # MixtureAttention: q_proj, k_proj, v_proj, o_proj
+    # (q_proj/k_proj/v_proj already listed above for Siglip, also matches MixtureAttention)
+    - o_proj
+    # GemmaMLP: gate_proj, up_proj, down_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    # === Action Encoder ===
+    # ActionEncoder: linear_1, linear_2, linear_3
+    - linear_1
+    - linear_2
+    - linear_3
+
+  modules_to_save:
+    # ActionDecoder & ProprioEncoder: small modules, fully trainable for action space adaptation
+    - action_decoder
+    - proprio_encoder

@@ -1,0 +1,23 @@
+{
+  "grid_ascii": "  y=6 [  ][  ][B1][B2][B3][  ]\n  y=5 [  ][  ][  ][  ][  ][  ]\n  y=4 [A1][A2][  ][C1][C2][F1]\n  y=3 [A3][A4][R ][C3][C4][F2]\n  y=2 [  ][  ][  ][  ][  ][  ]\n  y=1 [  ][  ][  ][  ][  ][  ]\n      x=0 x=1 x=2 x=3 x=4 x=5",
+  "legend": {
+    "A1-A4": "warehouse shelves (west). A1: Nivea, Fanta; A2: HoneyStars, Nestle; A3: Duff, Vanish; A4: Heinz_Beans, Slam",
+    "B1-B3": "retail shelves (north), 3 layers each. B3 layer 2 currently has empty slots",
+    "C1-C2": "cold storage fridges, face south",
+    "C3-C4": "showcases (4 doors each), face north",
+    "F1-F2": "freezers",
+    "R": "robot start area / warehouse aisle"
+  },
+  "waypoints": {
+    "warehouse_aisle":   [2.0, 3.0],
+    "warehouse_mid":     [2.0, 4.5],
+    "main_north_junction": [2.0, 5.0],
+    "retail_aisle_entry":  [3.0, 5.0],
+    "retail_aisle_east":   [4.0, 5.5]
+  },
+  "shelf_approach": {
+    "warehouse_shelf_A1_front": {"pos": [2.0, 4.0], "face_deg": 180},
+    "warehouse_shelf_A3_front": {"pos": [2.0, 3.0], "face_deg": 180},
+    "retail_shelf_B3_front":    {"pos": [4.0, 5.5], "face_deg": 90}
+  }
+}

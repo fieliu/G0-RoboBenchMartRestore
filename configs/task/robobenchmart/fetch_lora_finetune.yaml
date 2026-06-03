@@ -1,0 +1,68 @@
+# @package _global_
+# LoRA fine-tuning G0Plus on Fetch robot (RoboBenchMart)
+# Cross-embodiment: R1Lite (26D action, 27D state) → Fetch (15D action, 15D state)
+
+defaults:
+  - override /data: fetch/pd_joint_pos
+  - override /model: vla/g0plus
+
+model:
+  pretrained_ckpt: /TO/Your/Path/G0Plus_260202
+  use_pretrained_norm_stats: False  # Recompute stats from Fetch data
+
+  # Training hyperparameters (slightly higher LR for cross-embodiment)
+  learning_rate: 5e-4
+  weight_decay: 1e-2
+  max_epochs: 10
+  grad_accumulation_steps: 2
+  warmup_steps: 500
+  lr_scheduler_type: "cosine"
+  batch_size: 4
+
+  # Cross-embodiment: override action/proprio dims for Fetch
+  model_arch:
+    action_dim: ${data.processor.action_output_dim}
+    proprio_dim: ${data.processor.proprio_output_dim}
+
+data:
+  dataset:
+    dataset_dirs:
+      - /TO/Your/Path/robobenchmart_pick_to_basket
+      - /TO/Your/Path/robobenchmart_restock_basket_to_shelf
+
+lora:
+  rank: 16
+  alpha: 32
+  dropout: 0.05
+  init_lora_weights: true
+  vlm_lr_multiplier: 0.5
+
+  target_modules:
+    # Vision Tower (Siglip) — LoRA
+    - q_proj
+    - k_proj
+    - v_proj
+    - out_proj
+    # SiglipMLP — LoRA
+    - fc1
+    - fc2
+    # Multi-modal Projector — LoRA
+    - linear
+    # VLM Mixture (Gemma) & Action Mixture — LoRA
+    - o_proj
+    # GemmaMLP — LoRA
+    - gate_proj
+    - up_proj
+    - down_proj
+    # Action Encoder internal layers (shape unchanged) — LoRA
+    - linear_2
+    - linear_3
+
+  modules_to_save:
+    # Cross-embodiment: input/output dimensions changed, MUST fully train
+    # ActionEncoder.linear_1: 26→15 (shape changed)
+    # ActionDecoder final layer: 26→15 (shape changed)
+    # ProprioEncoder: 27→15 (shape changed)
+    - action_encoder
+    - action_decoder
+    - proprio_encoder

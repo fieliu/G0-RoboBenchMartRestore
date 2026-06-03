@@ -1,0 +1,108 @@
+# @package _global_
+# Fetch robot (ds_fetch_basket) pd_joint_pos control mode
+# 15-DoF: base(3) + torso_lift(1) + arm(7) + head(2) + gripper(2)
+
+dataset:
+  _target_: galaxea_fm.data.base_lerobot_dataset.BaseLerobotDataset
+
+  dataset_dirs: null
+
+  shape_meta:
+    action:
+      - key: default
+        raw_shape: 15
+        shape: 15
+
+    state:
+      - key: default
+        raw_shape: 15
+        shape: 15
+
+    images:
+      - key: head_rgb
+        raw_shape:
+          - 3
+          - 256
+          - 256
+        shape:
+          - 3
+          - ${model.model_meta.input_image_size.0}
+          - ${model.model_meta.input_image_size.1}
+      - key: left_wrist_rgb
+        raw_shape:
+          - 3
+          - 128
+          - 128
+        shape:
+          - 3
+          - ${model.model_meta.input_image_size.0}
+          - ${model.model_meta.input_image_size.1}
+      - key: right_wrist_rgb
+        raw_shape:
+          - 3
+          - 128
+          - 128
+        shape:
+          - 3
+          - ${model.model_meta.input_image_size.0}
+          - ${model.model_meta.input_image_size.1}
+
+  action_size: 32
+  past_action_size: 0
+  obs_size: 1
+  val_set_proportion: 0.05
+
+
+processor:
+  _target_: galaxea_fm.processors.base_processor.BaseProcessor
+
+  shape_meta: ${data.dataset.shape_meta}
+  num_obs_steps: ${data.dataset.obs_size}
+  num_output_cameras: 3
+  action_output_dim: ${sum_shapes:${data.dataset.shape_meta.action}}
+  proprio_output_dim: ${sum_shapes:${data.dataset.shape_meta.state}}
+
+  # Fetch uses absolute joint positions (pd_joint_pos), no relative transforms needed
+  action_state_transforms: null
+
+  # action & state normalization (z-score, same as LIBERO)
+  use_stepwise_action_norm: False
+  norm_default_mode: ${model.model_meta.norm_default_mode}
+  norm_exception_mode: null
+
+  action_state_merger:
+    _target_: galaxea_fm.transforms.action_state_merger.ConcatLeftAlign
+
+  train_transforms:
+    head_rgb:
+      - _target_: torchvision.transforms.Resize
+        size: ${model.model_meta.input_image_size}
+      - _target_: galaxea_fm.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.5, 0.5, 0.5]
+        std: [0.5, 0.5, 0.5]
+    left_wrist_rgb:
+      - _target_: torchvision.transforms.Resize
+        size: ${model.model_meta.input_image_size}
+      - _target_: galaxea_fm.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.5, 0.5, 0.5]
+        std: [0.5, 0.5, 0.5]
+    right_wrist_rgb: ${data.processor.train_transforms.left_wrist_rgb}
+
+  val_transforms:
+    head_rgb:
+      - _target_: torchvision.transforms.Resize
+        size: ${model.model_meta.input_image_size}
+      - _target_: galaxea_fm.transforms.image.ToTensor
+      - _target_: torchvision.transforms.Normalize
+        mean: [0.5, 0.5, 0.5]
+        std: [0.5, 0.5, 0.5]
+    left_wrist_rgb: ${data.processor.val_transforms.head_rgb}
+    right_wrist_rgb: ${data.processor.val_transforms.head_rgb}
+
+  # instruction: RoboBenchMart task descriptions (English only)
+  drop_high_level_prob: 1.0
+  use_zh_instruction: False
+
+  tokenizer: ${model.tokenizer}

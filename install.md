@@ -1,0 +1,154 @@
+# GalaxeaVLA 服务器配置教程
+
+> 版本/命令/环境变量均来自项目 `pyproject.toml` 与上游 `README.md`（已核实）。
+> 系统/驱动层面的要求是基于这些依赖推断的通用做法。
+> 每一步都附 **✅ 验证** 命令，确认安装正确再进入下一步。
+
+## 一、系统与硬件要求
+
+```
+操作系统:  Linux (Ubuntu 20.04/22.04 推荐)。WSL2 可行, 但 GPU 驱动走 Windows 侧。
+Python:    严格 3.10  (pyproject: >=3.10.16,<3.11) —— 不能用 3.11/3.12
+CUDA:      12.8  (torch 装的是 cu128 wheel)
+GPU 驱动:  支持 CUDA 12.8 → NVIDIA driver ≥ 535 建议
+GPU 显存:
+   推理:        > 8 GB   (RTX 3090/4090)
+   全量微调:    > 70 GB  (A100 80G / H20 96G)
+   LoRA 微调:   远低于全量, A100 40G 可行
+系统包:    ffmpeg (视频编解码必需)
+```
+
+## 二、配置步骤（每步带验证）
+
+### 步骤 0：检查 GPU 和驱动
+
+```bash
+nvidia-smi
+```
+**✅ 验证**：能看到 GPU 型号 + `CUDA Version: 12.x`（≥12.8 最佳）。看不到先解决驱动。
+
+### 步骤 1：装系统依赖
+
+```bash
+sudo apt update && sudo apt install -y ffmpeg git
+ffmpeg -version    # ✅ 验证: 有版本号输出
+```
+
+### 步骤 2：安装 uv（项目指定的包管理器，勿用 conda）
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source $HOME/.local/bin/env    # 或重开终端
+uv --version                   # ✅ 验证: 有版本号
+```
+
+> 国内网络可在终端开头加镜像：
+> ```bash
+> export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
+> export UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download
+> ```
+
+### 步骤 3：同步依赖 + 安装项目
+
+```bash
+cd /home/lh/VLA/GalaxeaVLA-main
+uv sync --index-strategy unsafe-best-match
+source .venv/bin/activate
+uv pip install -e .
+uv pip install -e .[dev]
+```
+**✅ 验证**（最关键一步）：
+```bash
+python --version                                  # 应是 3.10.x
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+# 期望: 2.7.1+cu128 True
+```
+`torch.cuda.is_available()` 必须为 `True`。若为 `False`：驱动不支持 cu128，或 WSL 里 GPU 没透传（最常见卡点）。
+
+### 步骤 4：验证核心库导入
+
+```bash
+python -c "import transformers, peft, accelerate, diffusers; \
+print('transformers', transformers.__version__, '| peft', peft.__version__)"
+# 期望: transformers 4.57.1 | peft 0.18.0
+
+python -c "import galaxea_fm; print('galaxea_fm OK')"
+```
+**✅ 验证**：无 ImportError，版本号对得上，项目包本身能导入（确认 `-e .` 生效）。
+
+### 步骤 5：验证数据/视频工具链（转换 h5 要用）
+
+```bash
+python -c "import h5py, av, cv2, numpy; \
+print('h5py', h5py.__version__, '| numpy', numpy.__version__)"
+# 期望: numpy 1.26.4 (必须 1.x, 不是 2.x)
+```
+**✅ 验证**：`av`(PyAV) 能导入——转换脚本编码 mp4 必须靠它。
+
+### 步骤 6：设置环境变量
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com                       # HF 国内镜像
+export HF_DATASETS_CACHE=/home/lh/VLA/hf_cache                 # HF 缓存(空目录)
+export GALAXEA_FM_OUTPUT_DIR=/home/lh/VLA/outputs              # 权重/日志输出
+export GALAXEA_FM_DATASET_STATS_CACHE_DIR=/home/lh/VLA/stats   # 归一化统计缓存
+export SWANLAB_API_KEY=<你的key>                               # 训练日志(可选)
+mkdir -p $HF_DATASETS_CACHE $GALAXEA_FM_OUTPUT_DIR $GALAXEA_FM_DATASET_STATS_CACHE_DIR
+echo $GALAXEA_FM_OUTPUT_DIR    # ✅ 验证: 非空且目录存在
+```
+
+> 建议写进 `~/.bashrc`，避免每次重开终端丢失。
+
+### 步骤 7：下载预训练权重
+
+```bash
+huggingface-cli download OpenGalaxea/G0-VLA G0Plus_3B_base \
+    --local-dir /home/lh/VLA/ckpts/G0Plus_3B_base
+ls -lh /home/lh/VLA/ckpts/G0Plus_3B_base/   # ✅ 验证: 有 .pt/.safetensors, 数 GB
+```
+
+### 步骤 8：端到端冒烟测试
+
+```bash
+cd /home/lh/VLA/GalaxeaVLA-main
+python scripts/deploy_supermarket.py \
+    --command "test" --map-file configs/maps/store_layout1.json \
+    --mode simulate --vlm-provider qwen 2>&1 | head -20
+```
+**✅ 验证**：能进入调度循环、不报 ImportError/语法错误（mock 模式无 API key 时在规划处停是预期的，说明依赖链路通了）。
+
+## 三、一键验证脚本
+
+存为 `check_env.sh`，一次性核对全部：
+
+```bash
+#!/bin/bash
+echo "=== Python ===" && python --version
+echo "=== Torch+CUDA ===" && python -c "import torch; print(torch.__version__, 'cuda:', torch.cuda.is_available())"
+echo "=== Core libs ===" && python -c "import transformers,peft,accelerate,diffusers,galaxea_fm; print('imports OK')"
+echo "=== Data libs ===" && python -c "import h5py,av,cv2,numpy; print('numpy',numpy.__version__)"
+echo "=== ffmpeg ===" && ffmpeg -version | head -1
+echo "=== Env vars ===" && echo "OUT=$GALAXEA_FM_OUTPUT_DIR"
+echo "=== GPU ===" && nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+```
+全部无报错、`cuda: True`、版本号对得上 = 配置成功。
+
+## 四、常见坑
+
+```
+1. torch.cuda.is_available()=False
+   → WSL 里需在 Windows 装 NVIDIA driver (含 WSL 支持), Linux 侧不要再装驱动
+   → 检查: nvidia-smi 在 WSL 里能否输出
+
+2. Python 版本不对
+   → 必须 3.10。uv sync 会自动拉 3.10, 别用系统 python
+
+3. numpy 2.x 冲突
+   → 项目锁 1.26.4。被带成 2.x 会 ABI 报错 → uv pip install numpy==1.26.4
+
+4. 显存不足 (微调)
+   → 全量要 70G。LoRA + A100 40G 若仍 OOM: 降 batch_size 4→2 + grad_accum 2→4
+
+5. HF 下载慢/失败
+   → export HF_ENDPOINT=https://hf-mirror.com (步骤6已含)
+```
