@@ -173,3 +173,44 @@ echo "=== GPU ===" && nvidia-smi --query-gpu=name,memory.total --format=csv,nohe
 5. HF 下载慢/失败
    → export HF_ENDPOINT=https://hf-mirror.com (步骤6已含)
 ```
+bash scripts/run/finetune.sh 2 robobenchmart/fetch_lora_finetune \
+  model.batch_size=2 model.grad_accumulation_steps=4 \
+  model.model_arch.pretrained_model_path=./ckpts/paligemma-3b-pt-224 \
+  logger.type=swanlab logger.mode=disabled \
+  checkpointing_steps=500
+
+  uv pip install nvidia-npp-cu12
+  conda install -c conda-forge "ffmpeg=6"
+
+cd ~/VLA/G0-RoboBenchMartRestore && source .venv/bin/activate
+export GALAXEA_FM_OUTPUT_DIR=/public/home/nwpu_liyl/VLA/outputs
+export LD_LIBRARY_PATH=$(pwd)/.venv/lib/python3.10/site-packages/nvidia/npp/lib:$LD_LIBRARY_PATH
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+bash scripts/run/finetune.sh 2 robobenchmart/fetch_lora_finetune \
+  model.batch_size=2 model.grad_accumulation_steps=4 \
+  model.model_arch.vla_training_strategy=action-expert-only \
+  model.model_arch.pretrained_model_path=./ckpts/paligemma-3b-pt-224 \
+  model.pretrained_ckpt=./ckpts/G0Plus_3B_base/model_state_dict.pt \
+  load_legacy_checkpoint=true \
+  logger.type=swanlab logger.mode=disabled \
+  checkpointing_steps=500
+
+
+cd ~/VLA/G0-RoboBenchMartRestore && source .venv/bin/activate
+
+# —— 4个环境变量, 一个都不能少 ——
+export GALAXEA_FM_OUTPUT_DIR=/public/home/nwpu_liyl/VLA/outputs
+export GALAXEA_FM_DATASET_STATS_CACHE_DIR=/public/home/nwpu_liyl/VLA/stats   # ← 这次补上
+export LD_LIBRARY_PATH=$(pwd)/.venv/lib/python3.10/site-packages/nvidia/npp/lib:$LD_LIBRARY_PATH
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+bash scripts/run/finetune_lora_fetch.sh 2 \
+  model.batch_size=2 model.grad_accumulation_steps=4 \
+  model.model_arch.pretrained_model_path=./ckpts/paligemma-3b-pt-224 \
+  model.pretrained_ckpt=./ckpts/G0Plus_3B_base \
+  logger.type=swanlab logger.mode=disabled \
+  checkpointing_steps=500
+
+
+

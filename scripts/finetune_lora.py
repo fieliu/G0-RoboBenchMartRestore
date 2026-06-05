@@ -93,10 +93,13 @@ def load_base_weights_into_model(pretrained_path, model):
 
 def inject_lora_into_model(model, lora_cfg):
     modules_to_save = list(lora_cfg.get("modules_to_save", [])) if lora_cfg.get("modules_to_save") else None
+    # Convert OmegaConf ListConfig -> native list so peft can JSON-serialize
+    # adapter_config.json when saving (ListConfig is not JSON serializable).
+    target_modules = list(lora_cfg.target_modules)
     lora_config = LoraConfig(
         r=lora_cfg.rank,
         lora_alpha=lora_cfg.alpha,
-        target_modules=lora_cfg.target_modules,
+        target_modules=target_modules,
         lora_dropout=lora_cfg.dropout,
         init_lora_weights=lora_cfg.init_lora_weights,
         modules_to_save=modules_to_save,
