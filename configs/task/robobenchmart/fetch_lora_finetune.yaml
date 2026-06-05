@@ -7,7 +7,7 @@ defaults:
   - override /model: vla/g0plus
 
 model:
-  pretrained_ckpt: /TO/Your/Path/G0Plus_260202
+  pretrained_ckpt: ./ckpts/G0Plus_3B_base/model_state_dict.pt
   use_pretrained_norm_stats: False  # Recompute stats from Fetch data
 
   # Training hyperparameters (slightly higher LR for cross-embodiment)
@@ -27,8 +27,9 @@ model:
 data:
   dataset:
     dataset_dirs:
-      - /TO/Your/Path/robobenchmart_pick_to_basket
-      - /TO/Your/Path/robobenchmart_restock_basket_to_shelf
+      - /public/home/nwpu_liyl/VLA/datasets/warehouse_fetch/pick_from_floor
+      - /public/home/nwpu_liyl/VLA/datasets/warehouse_fetch/restock_basket_to_shelf
+      - /public/home/nwpu_liyl/VLA/datasets/warehouse_fetch/pick_to_basket
 
 lora:
   rank: 16

@@ -151,15 +151,28 @@ model_arch:
 VLM 把指令拆成子任务序列, 顺序执行。地图是文本 (`configs/maps/store_layout1.json`)。
 
 ```bash
-export DASHSCOPE_KEY=sk-xxxx     # 或用 --vlm-api-key 传入
+export VLM_API_KEY=sk-xxxx     # 代码读这个环境变量; 或用 --vlm-api-key 传入
 
 python scripts/deploy_supermarket.py \
     --command "restock Nivea from warehouse A1 to shelf B3 layer 2" \
     --map-file configs/maps/store_layout1.json \
-    --vlm-provider qwen --vlm-api-key $DASHSCOPE_KEY \
+    --vlm-provider qwen --vlm-api-key $VLM_API_KEY \
     --vla-ckpt /path/to/fetch_lora_ckpt \
     --mode simulate
 ```
+
+### 选 VLM 规划器的模型 / API
+
+只需给 `--vlm-provider` + key 就能跑，`--vlm-model` 不给则用默认模型：
+
+| provider | 默认模型 | 用的库 | key 来源 |
+|----------|---------|-------|---------|
+| `qwen` | `qwen-vl-max` | dashscope | 阿里云百炼 |
+| `gemini` | `gemini-2.0-flash` | openai (改 base_url) | Google AI Studio |
+| `openai` | `gpt-4o` | openai | OpenAI |
+
+两条硬标准：① **必须是 VLM（能看图）**——规划可喂头部 RGB，judge 必须看前后帧，纯文本模型用不了；
+② 指令跟随强、JSON 输出稳——规划/judge 都要求 JSON。规划任务不难（从清单选 waypoint），默认模型都够用。
 
 参数:
 

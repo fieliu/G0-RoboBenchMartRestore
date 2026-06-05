@@ -1,6 +1,7 @@
-# @package _global_
 # Fetch robot (ds_fetch_basket) pd_joint_pos control mode
-# 15-DoF: base(3) + torso_lift(1) + arm(7) + head(2) + gripper(2)
+# State 15-DoF: base_pos(3) + torso_lift(1) + arm(7) + head(2) + gripper(2)
+# Action 13-D : arm(7) + gripper(1,mimic) + body[head_pan,head_tilt,torso_lift](3) + base_vel(2)
+#   (action != state: base 是差速速度2维非位置3维; gripper 是联动1维非两指2维)
 
 dataset:
   _target_: galaxea_fm.data.base_lerobot_dataset.BaseLerobotDataset
@@ -10,8 +11,8 @@ dataset:
   shape_meta:
     action:
       - key: default
-        raw_shape: 15
-        shape: 15
+        raw_shape: 13
+        shape: 13
 
     state:
       - key: default

@@ -93,18 +93,39 @@ export HF_DATASETS_CACHE=/home/lh/VLA/hf_cache                 # HF 缓存(空�
 export GALAXEA_FM_OUTPUT_DIR=/home/lh/VLA/outputs              # 权重/日志输出
 export GALAXEA_FM_DATASET_STATS_CACHE_DIR=/home/lh/VLA/stats   # 归一化统计缓存
 export SWANLAB_API_KEY=<你的key>                               # 训练日志(可选)
+export VLM_API_KEY=sk-xxxx                                     # VLM 规划器 key(部署用)
 mkdir -p $HF_DATASETS_CACHE $GALAXEA_FM_OUTPUT_DIR $GALAXEA_FM_DATASET_STATS_CACHE_DIR
 echo $GALAXEA_FM_OUTPUT_DIR    # ✅ 验证: 非空且目录存在
 ```
 
 > 建议写进 `~/.bashrc`，避免每次重开终端丢失。
 
+### 步骤 6.5：配置 VLM 规划器（仅部署需要，训练不需要）
+
+部署 (`deploy_supermarket.py`) 的高层规划器走云端 VLM API。**只需给 provider + key 就能跑**，
+不指定 model 则用默认模型。代码读环境变量 `VLM_API_KEY`，或用 `--vlm-api-key` 传入。
+
+| provider | 默认模型 | 装库 | key 来源 |
+|----------|---------|------|---------|
+| `qwen`(默认) | `qwen-vl-max` | `uv pip install dashscope` | 阿里云百炼 |
+| `gemini` | `gemini-2.0-flash` | `uv pip install openai` | Google AI Studio |
+| `openai` | `gpt-4o` | `uv pip install openai` | OpenAI |
+
+```bash
+uv pip install dashscope     # 用 qwen 必装; gemini/openai 则装 openai
+python -c "import dashscope; print('dashscope OK')"   # ✅ 验证
+```
+
+> 选型两条硬标准：① 必须是 **VLM（能看图）**——judge 要看头部前后帧，纯文本模型用不了；
+> ② 指令跟随强、JSON 输出稳。规划任务不难，默认模型都够用。
+> 想换具体型号才加 `--vlm-model <name>`。不配 key 也能跑（mock 规划，仅测架构）。
+
 ### 步骤 7：下载预训练权重
 
 ```bash
 huggingface-cli download OpenGalaxea/G0-VLA G0Plus_3B_base \
-    --local-dir /home/lh/VLA/ckpts/G0Plus_3B_base
-ls -lh /home/lh/VLA/ckpts/G0Plus_3B_base/   # ✅ 验证: 有 .pt/.safetensors, 数 GB
+    --local-dir ./ckpts/G0Plus_3B_base
+ls -lh ./ckpts/G0Plus_3B_base/   # ✅ 验证: 有 .pt/.safetensors, 数 GB
 ```
 
 ### 步骤 8：端到端冒烟测试
