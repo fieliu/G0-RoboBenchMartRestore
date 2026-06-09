@@ -247,6 +247,7 @@ grep -rnE "VideoDecoder|device=|torchcodec|decode" src/galaxea_fm/data/ .venv/li
 source .venv/bin/activate
 
 CKPT=/public/home/nwpu_liyl/VLA/outputs/robobenchmart/fetch_lora_finetune/2026-06-06_01-31-55/checkpoints/step_106116/model.pt
+export GALAXEA_FM_OUTPUT_DIR=./outputs
 # 拿商品放篮子
 python scripts/eval_robobenchmart.py \
     --scene-dir $RBM_ROOT/demo_envs/pick_to_basket \

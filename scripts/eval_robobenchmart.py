@@ -283,6 +283,8 @@ def run_episode(env, policy, processor, sensor_names: dict,
 @torch.no_grad()
 def eval_main(cfg: DictConfig) -> None:
     """Core evaluation logic, receives a fully-resolved Hydra config."""
+    from galaxea_fm.utils.config_resolvers import register_default_resolvers
+    register_default_resolvers()
     OmegaConf.resolve(cfg)
 
     # Extract eval-specific params from cfg.ckpt_path convention
