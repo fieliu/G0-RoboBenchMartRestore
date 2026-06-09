@@ -54,6 +54,17 @@ def load_policy(ckpt_path: str, cfg: DictConfig, device: str = "cuda"):
     from hydra.utils import instantiate
     from galaxea_fm.utils.load_pretrained_resumed import load_checkpoint_for_eval
 
+    # Skip loading pre-trained VLM weights during eval — the full checkpoint
+    # (including LoRA-adapted weights) will be loaded by load_checkpoint_for_eval.
+    # If pretrained_model_path is a placeholder, instantiate would fail with
+    # "No pre-trained weights found".
+    try:
+        OmegaConf.set_struct(cfg.model.model_arch, False)
+        cfg.model.model_arch.pretrained_model_path = None
+        OmegaConf.set_struct(cfg.model.model_arch, True)
+    except Exception:
+        pass
+
     policy = instantiate(cfg.model.model_arch)
     policy, stats = load_checkpoint_for_eval(ckpt_path, policy, device="cpu")
     policy = policy.to(device).eval()
