@@ -9,12 +9,11 @@ Usage:
         --scene-dir /path/to/RoboBenchMart-main/demo_envs/pick_to_basket \
         --env-name PickToBasketContNiveaEnv \
         --ckpt-path ./ckpts/fetch_lora_best/best_model.pt \
-        --num-traj 10 --save-video
+        -n 10 --save-video
 
 If --env-name is omitted, it is auto-detected from the scene's json metadata.
 """
 
-import argparse
 import json
 import logging
 import multiprocessing as mp
@@ -25,7 +24,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
-from tqdm import tqdm
+import torch
+from omegaconf import DictConfig, OmegaConf
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -35,29 +35,13 @@ RBM_ROOT = os.environ.get("RBM_ROOT", "/home/lh/VLA/RoboBenchMart-main")
 
 
 # ------------------------------------------------------------------
-# 1. Model loading (same as VLAExecutor in deploy_supermarket.py)
+# 1. Model loading
 # ------------------------------------------------------------------
 
-def load_policy(ckpt_path: str,
-                task_cfg: str = "robobenchmart/fetch_lora_finetune",
-                device: str = "cuda"):
-    """Load LoRA-finetuned G0Plus policy + processor.
-
-    Uses Hydra compose to properly merge defaults (data, model) before
-    resolving interpolations like ${data.processor.action_output_dim}.
-    """
-    from omegaconf import OmegaConf
-    from hydra import initialize, compose
+def load_policy(ckpt_path: str, cfg: DictConfig, device: str = "cuda"):
+    """Load LoRA-finetuned G0Plus policy + processor from a resolved Hydra cfg."""
     from hydra.utils import instantiate
-    from galaxea_fm.utils.config_resolvers import register_default_resolvers
     from galaxea_fm.utils.load_pretrained_resumed import load_checkpoint_for_eval
-
-    register_default_resolvers()
-
-    with initialize(version_base="1.3", config_path="../configs"):
-        cfg = compose(config_name="train.yaml",
-                      overrides=[f"task={task_cfg}"])
-    OmegaConf.resolve(cfg)
 
     policy = instantiate(cfg.model.model_arch)
     policy, stats = load_checkpoint_for_eval(ckpt_path, policy, device="cpu")
@@ -68,11 +52,11 @@ def load_policy(ckpt_path: str,
     processor.eval()
 
     logger.info(f"Loaded policy from {ckpt_path}")
-    return policy, processor, cfg
+    return policy, processor
 
 
 # ------------------------------------------------------------------
-# 2. Observation construction (from deploy_supermarket.py SimEnv.get_obs)
+# 2. Observation construction
 # ------------------------------------------------------------------
 
 def get_sensor_names(env):
@@ -96,7 +80,6 @@ def get_sensor_names(env):
 
 def build_vla_obs(env, sensor_names: dict) -> Dict:
     """Build observation dict for VLA policy from ManiSkill env."""
-    import torch
     import cv2
 
     sensor_data = env.scene.get_sensor_data()
@@ -142,13 +125,12 @@ def build_vla_obs(env, sensor_names: dict) -> Dict:
 
 
 # ------------------------------------------------------------------
-# 3. Action prediction (same as VLAExecutor.act)
+# 3. Action prediction
 # ------------------------------------------------------------------
 
 def predict_action(policy, processor, obs: Dict, task: str,
                    coarse_task: str, device: str = "cuda") -> np.ndarray:
     """Predict 15-DoF action from observation."""
-    import torch
     from galaxea_fm.utils.pytorch_utils import dict_apply
 
     sample = {
@@ -202,7 +184,6 @@ def make_env(scene_dir: str, env_name: Optional[str] = None,
     import gymnasium as gym
     import mani_skill  # noqa: F401 — registers envs
 
-    # Try to auto-detect env_name from scene metadata
     if env_name is None:
         json_path = os.path.join(scene_dir, "episode_metadata.json")
         if os.path.exists(json_path):
@@ -252,10 +233,8 @@ def run_episode(env, policy, processor, sensor_names: dict,
     success = False
 
     while step < max_horizon:
-        # Build VLA observation
         vla_obs = build_vla_obs(env, sensor_names)
 
-        # Record frames before action
         if save_video_flag:
             frames_head.append(vla_obs["head_rgb_raw"].copy())
             try:
@@ -265,17 +244,14 @@ def run_episode(env, policy, processor, sensor_names: dict,
             except Exception:
                 pass
 
-        # Predict action
         action_chunk = predict_action(
             policy, processor, vla_obs,
             task=language_instruction,
             coarse_task=coarse_task,
         )
 
-        # Execute replan_steps actions from the chunk
         for i in range(min(replan_steps, action_chunk.shape[0])):
             action = action_chunk[i].astype(np.float32)
-            # Zero out unused gripper joints (indices 8, 9) — same as eval_policy_client
             action[8] = 0
             action[9] = 0
             obs_ms, reward, done, truncated, info = env.step(action)
@@ -301,74 +277,64 @@ def run_episode(env, policy, processor, sensor_names: dict,
 
 
 # ------------------------------------------------------------------
-# 7. Main
+# 7. Main — Hydra entry point
 # ------------------------------------------------------------------
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Closed-loop eval on RoboBenchMart")
-    parser.add_argument("--scene-dir", type=str, required=True,
-                        help="Path to scene directory (e.g. demo_envs/pick_to_basket)")
-    parser.add_argument("--env-name", type=str, default=None,
-                        help="Gym env id. Auto-detected from scene metadata if omitted.")
-    parser.add_argument("--ckpt-path", type=str, required=True,
-                        help="Path to LoRA checkpoint (e.g. best_model.pt)")
-    parser.add_argument("--task-cfg", type=str,
-                        default="robobenchmart/fetch_lora_finetune",
-                        help="Hydra task config name (e.g. robobenchmart/fetch_lora_finetune)")
-    parser.add_argument("--coarse-task", type=str, default="",
-                        help="High-level task description for coarse_task channel. "
-                             "If empty, uses the env's language_instruction.")
-    parser.add_argument("-n", "--num-traj", type=int, default=10,
-                        help="Number of evaluation episodes")
-    parser.add_argument("--max-horizon", type=int, default=300,
-                        help="Max steps per episode")
-    parser.add_argument("--replan-steps", type=int, default=5,
-                        help="How many actions to execute per model inference")
-    parser.add_argument("--start-seed", type=int, default=0,
-                        help="Starting seed for episode randomization")
-    parser.add_argument("--sim-backend", type=str, default="auto",
-                        choices=["auto", "cpu", "gpu"])
-    parser.add_argument("--shader", type=str, default="default",
-                        help="Render shader: default (fast), rt, rt-fast")
-    parser.add_argument("--save-video", action="store_true",
-                        help="Save head-camera + third-person videos per episode")
-    parser.add_argument("--video-dir", type=str, default=None,
-                        help="Directory to save videos (default: <scene-dir>/eval_videos/)")
-    parser.add_argument("--device", type=str, default="cuda")
-    return parser.parse_args()
+@torch.no_grad()
+def eval_main(cfg: DictConfig) -> None:
+    """Core evaluation logic, receives a fully-resolved Hydra config."""
+    OmegaConf.resolve(cfg)
 
+    # Extract eval-specific params from cfg.ckpt_path convention
+    # or from env vars / hydra overrides
+    ckpt_path = cfg.get("ckpt_path")
+    scene_dir = cfg.get("eval_scene_dir",
+                        os.environ.get("EVAL_SCENE_DIR", ""))
+    env_name = cfg.get("eval_env_name",
+                       os.environ.get("EVAL_ENV_NAME", None))
+    coarse_task = cfg.get("eval_coarse_task", "")
+    num_traj = cfg.get("eval_num_traj", 10)
+    max_horizon = cfg.get("eval_max_horizon", 300)
+    replan_steps = cfg.get("eval_replan_steps", 5)
+    start_seed = cfg.get("eval_start_seed", 0)
+    sim_backend = cfg.get("eval_sim_backend", "auto")
+    shader = cfg.get("eval_shader", "default")
+    save_video_flag = cfg.get("eval_save_video", False)
+    video_dir = cfg.get("eval_video_dir", None)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
-def main():
-    args = parse_args()
+    assert ckpt_path, "Must set ckpt_path (via +ckpt_path=... or env)"
+    assert scene_dir, "Must set eval_scene_dir (via +eval_scene_dir=... or EVAL_SCENE_DIR env)"
 
     # Load policy
-    policy, processor, cfg = load_policy(args.ckpt_path, args.task_cfg, args.device)
+    policy, processor = load_policy(ckpt_path, cfg, device)
 
     # Create environment
-    env = make_env(args.scene_dir, args.env_name, args.sim_backend, args.shader)
+    env = make_env(scene_dir, env_name, sim_backend, shader)
     sensor_names = get_sensor_names(env)
     logger.info(f"Sensor names: {sensor_names}")
 
     # Video output dir
-    video_dir = args.video_dir or os.path.join(args.scene_dir, "eval_videos")
-    if args.save_video:
+    if not video_dir:
+        video_dir = os.path.join(scene_dir, "eval_videos")
+    if save_video_flag:
         os.makedirs(video_dir, exist_ok=True)
         logger.info(f"Videos will be saved to {video_dir}")
 
     # Run episodes
     results = []
-    pbar = tqdm(range(args.num_traj), desc="Evaluating")
+    from tqdm import tqdm
+    pbar = tqdm(range(num_traj), desc="Evaluating")
 
     for traj_idx in pbar:
-        seed = args.start_seed + traj_idx
-        coarse_task = args.coarse_task or ""
+        seed = start_seed + traj_idx
 
         ep = run_episode(
             env, policy, processor, sensor_names,
             coarse_task=coarse_task,
-            max_horizon=args.max_horizon,
-            replan_steps=args.replan_steps,
-            save_video_flag=args.save_video,
+            max_horizon=max_horizon,
+            replan_steps=replan_steps,
+            save_video_flag=save_video_flag,
             seed=seed,
         )
 
@@ -380,8 +346,7 @@ def main():
             "instruction": ep["instruction"],
         })
 
-        # Save videos
-        if args.save_video and ep["frames_head"]:
+        if save_video_flag and ep["frames_head"]:
             tag = f"ep{traj_idx:03d}_seed{seed}"
             save_video(ep["frames_head"],
                        os.path.join(video_dir, f"{tag}_head.mp4"), fps=30)
@@ -389,7 +354,6 @@ def main():
                 save_video(ep["frames_third"],
                            os.path.join(video_dir, f"{tag}_third.mp4"), fps=30)
 
-        # Update progress bar
         successes_so_far = sum(r["success"] for r in results)
         sr = successes_so_far / len(results) * 100
         pbar.set_postfix({"success_rate": f"{sr:.1f}%", "successes": successes_so_far})
@@ -403,8 +367,8 @@ def main():
     success_seeds = [r["seed"] for r in results if r["success"]]
 
     print("\n" + "=" * 60)
-    print(f"  Scene: {args.scene_dir}")
-    print(f"  Checkpoint: {args.ckpt_path}")
+    print(f"  Scene: {scene_dir}")
+    print(f"  Checkpoint: {ckpt_path}")
     print(f"  Episodes: {total}")
     print(f"  Successes: {successes}")
     print(f"  Success Rate: {successes / total * 100:.1f}%")
@@ -413,12 +377,12 @@ def main():
     print("=" * 60)
 
     # Save results json
-    results_path = os.path.join(video_dir if args.save_video else args.scene_dir,
+    results_path = os.path.join(video_dir if save_video_flag else scene_dir,
                                 "eval_results.json")
     with open(results_path, "w") as f:
         json.dump({
-            "scene_dir": args.scene_dir,
-            "ckpt_path": args.ckpt_path,
+            "scene_dir": scene_dir,
+            "ckpt_path": ckpt_path,
             "num_traj": total,
             "successes": successes,
             "success_rate": successes / total * 100,
@@ -426,6 +390,18 @@ def main():
             "episodes": results,
         }, f, indent=2)
     logger.info(f"Results saved to {results_path}")
+
+
+# ------------------------------------------------------------------
+# Hydra decorator — same pattern as eval_libero.py
+# ------------------------------------------------------------------
+
+import hydra
+
+
+@hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
+def main(cfg: DictConfig) -> Optional[float]:
+    eval_main(cfg)
 
 
 if __name__ == "__main__":
