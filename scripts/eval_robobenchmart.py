@@ -52,10 +52,13 @@ FETCH_ACTION_DIM = 13
 def load_policy(ckpt_path: str, cfg: DictConfig, device: str = "cuda"):
     """Load LoRA-finetuned G0Plus policy + processor from a resolved Hydra cfg."""
     from hydra.utils import instantiate
-    from galaxea_fm.utils.load_pretrained_resumed import load_checkpoint_for_eval
+    from galaxea_fm.utils.load_pretrained_resumed import (
+        load_checkpoint_for_eval,
+        load_dataset_stats_from_json,
+    )
 
     # Skip loading pre-trained VLM weights during eval — the full checkpoint
-    # (including LoRA-adapted weights) will be loaded by load_checkpoint_for_eval.
+    # (including LoRA-adapted weights) will be loaded below.
     # If pretrained_model_path is a placeholder, instantiate would fail with
     # "No pre-trained weights found".
     try:
@@ -66,7 +69,34 @@ def load_policy(ckpt_path: str, cfg: DictConfig, device: str = "cuda"):
         pass
 
     policy = instantiate(cfg.model.model_arch)
-    policy, stats = load_checkpoint_for_eval(ckpt_path, policy, device="cpu")
+
+    # Load checkpoint — handle both directory format and legacy .pt format.
+    # Legacy .pt may contain {"model_state_dict": ..., ...} OR be a bare state_dict.
+    ckpt = Path(ckpt_path)
+    if ckpt.is_dir():
+        # New format: directory with model.pt + dataset_stats.json
+        policy, stats = load_checkpoint_for_eval(ckpt_path, policy, device="cpu")
+    else:
+        # Legacy format: single .pt file
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+            policy.load_state_dict(state_dict["model_state_dict"], strict=True)
+        else:
+            # Bare state_dict (no wrapper)
+            policy.load_state_dict(state_dict, strict=True)
+        # Find dataset_stats.json: same location as new-format checkpoints
+        stats_path = ckpt.parent.parent / "dataset_stats.json"
+        if not stats_path.exists():
+            # Try other common locations
+            for candidate in [
+                ckpt.parent / "dataset_stats.json",
+                ckpt.parent.parent.parent / "dataset_stats.json",
+            ]:
+                if candidate.exists():
+                    stats_path = candidate
+                    break
+        stats = load_dataset_stats_from_json(stats_path)
+
     policy = policy.to(device).eval()
 
     # Move action tokenizer to same device if present
