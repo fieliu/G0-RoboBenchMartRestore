@@ -335,7 +335,8 @@ def make_env(scene_dir: str, env_name: Optional[str] = None,
     """Create RoboBenchMart gym environment."""
     sys.path.append(RBM_ROOT)
     import gymnasium as gym
-    import mani_skill  # noqa: F401 — registers envs
+    import mani_skill  # noqa: F401 — registers ManiSkill envs
+    import dsynth.envs  # noqa: F401 — registers RoboBenchMart custom envs
 
     if env_name is None:
         json_path = os.path.join(scene_dir, "episode_metadata.json")
