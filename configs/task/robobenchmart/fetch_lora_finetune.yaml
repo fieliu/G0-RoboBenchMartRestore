@@ -26,10 +26,12 @@ model:
 
 data:
   dataset:
+    # Set GALAXEA_FM_DATA_DIR env var to your data root on the server.
+    # Default: /public/home/nwpu_liyl/VLA (original training server)
     dataset_dirs:
-      - /public/home/nwpu_liyl/VLA/datasets/warehouse_fetch/pick_from_floor
-      - /public/home/nwpu_liyl/VLA/datasets/warehouse_fetch/restock_basket_to_shelf
-      - /public/home/nwpu_liyl/VLA/datasets/warehouse_fetch/pick_to_basket
+      - ${oc.env:GALAXEA_FM_DATA_DIR,/public/home/nwpu_liyl/VLA}/datasets/warehouse_fetch/pick_from_floor
+      - ${oc.env:GALAXEA_FM_DATA_DIR,/public/home/nwpu_liyl/VLA}/datasets/warehouse_fetch/restock_basket_to_shelf
+      - ${oc.env:GALAXEA_FM_DATA_DIR,/public/home/nwpu_liyl/VLA}/datasets/warehouse_fetch/pick_to_basket
 
 lora:
   rank: 16

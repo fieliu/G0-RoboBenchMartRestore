@@ -10,7 +10,7 @@ import sys
 import json
 import argparse
 
-RBM_ROOT = "/home/lh/VLA/RoboBenchMart-main"
+RBM_ROOT = os.environ.get("RBM_ROOT", "/home/lh/VLA/RoboBenchMart-main")
 sys.path.insert(0, RBM_ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

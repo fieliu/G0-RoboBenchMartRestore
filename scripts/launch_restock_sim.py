@@ -13,7 +13,7 @@ import sys
 import argparse
 import numpy as np
 
-RBM_ROOT = "/home/lh/VLA/RoboBenchMart-main"
+RBM_ROOT = os.environ.get("RBM_ROOT", "/home/lh/VLA/RoboBenchMart-main")
 
 
 def main():

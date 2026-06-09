@@ -41,6 +41,9 @@ import numpy as np
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("Deploy")
+
+# RoboBenchMart root: set RBM_ROOT env var to match your server layout
+RBM_ROOT = os.environ.get("RBM_ROOT", "/home/lh/VLA/RoboBenchMart-main")
 # ============================================================
 # 1. Task taxonomy — two families: VLA manipulation, navigation
 # ============================================================
@@ -493,14 +496,14 @@ class NavExecutor:
         self._yaw_kp, self._yaw_kd, self._yaw_prev = 1.5, 0.3, 0.0
 
         if backend == "navdp" and navdp_ckpt:
-            sys.path.append("/home/lh/VLA/RoboBenchMart-main")
+            sys.path.append(RBM_ROOT)
             from dsynth.navigation.navdp_controller import NavDPController
             self.controller = NavDPController(
                 model_path=navdp_ckpt, device=device,
             )
             logger.info(f"Nav: NavDP controller loaded from {navdp_ckpt}")
         elif backend == "motionplanner" and env is not None:
-            sys.path.append("/home/lh/VLA/RoboBenchMart-main")
+            sys.path.append(RBM_ROOT)
             from dsynth.planning.motionplanner import FetchMotionPlanningSapienSolver
             unwrapped = env.unwrapped if hasattr(env, 'unwrapped') else env
             self.controller = FetchMotionPlanningSapienSolver(unwrapped)
@@ -924,7 +927,7 @@ class RealEnvObsProvider:
             image_size: Resolution of top-down image.
         """
         import sys
-        sys.path.append("/home/lh/VLA/RoboBenchMart-main")
+        sys.path.append(RBM_ROOT)
         from dsynth.navigation.map_utils import StoreMapProvider
 
         self.env = env.unwrapped if hasattr(env, 'unwrapped') else env
@@ -1244,7 +1247,7 @@ def main():
         # Real RoboBenchMart simulation environment
         import gymnasium as gym
         import sys
-        sys.path.append("/home/lh/VLA/RoboBenchMart-main")
+        sys.path.append(RBM_ROOT)
 
         env = gym.make(
             args.env_name,

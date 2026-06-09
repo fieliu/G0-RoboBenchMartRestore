@@ -13,7 +13,7 @@ import argparse, os, sys, time
 import numpy as np, cv2
 import gymnasium as gym, sapien
 
-RBM_ROOT = "/home/lh/VLA/RoboBenchMart-main"
+RBM_ROOT = os.environ.get("RBM_ROOT", "/home/lh/VLA/RoboBenchMart-main")
 NAVDP_CKPT = os.path.join(RBM_ROOT, "dsynth/navigation/navdp_models/navdp-cross-modal.ckpt")
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, RBM_ROOT)
