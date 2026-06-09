@@ -189,13 +189,12 @@ def get_sensor_names(obs):
 def build_vla_obs(obs, sensor_names: dict, image_size: int = 224) -> Dict:
     """Build observation dict for VLA policy from ManiSkill obs.
 
-    Args:
-        obs: observation dict from env.step()/env.reset(), with 'sensor_data' and 'agent' keys.
-        sensor_names: mapping from VLA camera role to ManiSkill sensor key.
-        image_size: resize images to (image_size, image_size).
-
-    Returns images as float32 [0,1] tensors in (C, H, W) format,
-    matching what the processor expects after ToTensor.
+    Returns:
+        Dict with:
+        - images: torch tensors (1, C, H, W) uint8 — preprocess expects this format
+          (ToTensor inside processor will convert to float [0,1])
+        - state: {"default": torch tensor (1, state_dim) float32}
+        - *_rgb_raw: numpy (H, W, 3) uint8 for video saving
     """
     import cv2
 
@@ -236,22 +235,20 @@ def build_vla_obs(obs, sensor_names: dict, image_size: int = 224) -> Dict:
 
     qpos = obs["agent"]["qpos"][0].cpu().numpy()
 
-    # Resize and convert to (C, H, W) float32 [0, 1]
-    head_rgb = cv2.resize(head_rgb_raw, (image_size, image_size))
-    head_rgb = head_rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
-    left_wrist = cv2.resize(left_wrist_rgb_raw, (image_size, image_size))
-    left_wrist = left_wrist.transpose(2, 0, 1).astype(np.float32) / 255.0
-    right_wrist = cv2.resize(right_wrist_rgb_raw, (image_size, image_size))
-    right_wrist = right_wrist.transpose(2, 0, 1).astype(np.float32) / 255.0
+    # Resize to (image_size, image_size, 3) uint8, then convert to (1, C, H, W) torch tensor
+    # preprocess expects (num_obs_steps, C, H, W) uint8 — ToTensor will handle /255
+    def _to_tensor(img_raw):
+        resized = cv2.resize(img_raw, (image_size, image_size))  # (H, W, 3) uint8
+        return torch.from_numpy(resized).permute(2, 0, 1).unsqueeze(0)  # (1, C, H, W) uint8
 
     return {
-        "head_rgb": head_rgb,
-        "left_wrist_rgb": left_wrist,
-        "right_wrist_rgb": right_wrist,
+        "head_rgb": _to_tensor(head_rgb_raw),
+        "left_wrist_rgb": _to_tensor(left_wrist_rgb_raw),
+        "right_wrist_rgb": _to_tensor(right_wrist_rgb_raw),
         "head_rgb_raw": head_rgb_raw,
         "left_wrist_rgb_raw": left_wrist_rgb_raw,
         "right_wrist_rgb_raw": right_wrist_rgb_raw,
-        "state": {"default": qpos.astype(np.float32)},
+        "state": {"default": torch.from_numpy(qpos.astype(np.float32)).unsqueeze(0)},  # (1, state_dim)
     }
 
 
@@ -506,6 +503,11 @@ def eval_main(cfg: DictConfig) -> None:
 
     # Load policy
     policy, processor = load_policy(ckpt_path, cfg, device)
+
+    # Clear GlobalHydra so RoboBenchMart env can initialize its own Hydra context
+    # (env.__init__ calls hydra.initialize_config_dir internally)
+    from hydra.core.global_hydra import GlobalHydra
+    GlobalHydra.instance().clear()
 
     # Create environment
     env = make_env(scene_dir, env_name, sim_backend, shader)
