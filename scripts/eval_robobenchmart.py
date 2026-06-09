@@ -50,17 +50,21 @@ FETCH_ACTION_DIM = 13
 # ------------------------------------------------------------------
 
 def load_policy(ckpt_path: str, cfg: DictConfig, device: str = "cuda"):
-    """Load LoRA-finetuned G0Plus policy + processor from a resolved Hydra cfg."""
-    from hydra.utils import instantiate
-    from galaxea_fm.utils.load_pretrained_resumed import (
-        load_checkpoint_for_eval,
-        load_dataset_stats_from_json,
-    )
+    """Load LoRA-finetuned G0Plus policy + processor from a resolved Hydra cfg.
 
-    # Skip loading pre-trained VLM weights during eval — the full checkpoint
-    # (including LoRA-adapted weights) will be loaded below.
-    # If pretrained_model_path is a placeholder, instantiate would fail with
-    # "No pre-trained weights found".
+    Training saves the full PeftModel state_dict (base weights + LoRA weights
+    merged together) into model.pt. So we must:
+      1. Create base model (skip pretrained VLM loading — weights come from ckpt)
+      2. Inject LoRA adapters (same config as training)
+      3. Load the PeftModel state_dict from checkpoint
+    """
+    from hydra.utils import instantiate
+    from peft import LoraConfig, get_peft_model
+    from galaxea_fm.utils.load_pretrained_resumed import load_dataset_stats_from_json
+
+    # Skip loading pre-trained VLM weights during eval — all weights come from
+    # the checkpoint. If pretrained_model_path is a placeholder, instantiate
+    # would fail with "No pre-trained weights found".
     try:
         OmegaConf.set_struct(cfg.model.model_arch, False)
         cfg.model.model_arch.pretrained_model_path = None
@@ -68,34 +72,62 @@ def load_policy(ckpt_path: str, cfg: DictConfig, device: str = "cuda"):
     except Exception:
         pass
 
+    # Step 1: Create base model (no pretrained weights)
     policy = instantiate(cfg.model.model_arch)
 
-    # Load checkpoint — handle both directory format and legacy .pt format.
-    # Legacy .pt may contain {"model_state_dict": ..., ...} OR be a bare state_dict.
+    # Step 2: Inject LoRA adapters (must match training config)
+    lora_cfg = cfg.get("lora", None)
+    if lora_cfg is not None:
+        target_modules = list(lora_cfg.target_modules)
+        modules_to_save = list(lora_cfg.get("modules_to_save", [])) if lora_cfg.get("modules_to_save") else None
+        lora_config = LoraConfig(
+            r=lora_cfg.rank,
+            lora_alpha=lora_cfg.alpha,
+            target_modules=target_modules,
+            lora_dropout=lora_cfg.dropout,
+            init_lora_weights=lora_cfg.init_lora_weights,
+            modules_to_save=modules_to_save,
+        )
+        logger.info(f"Injecting LoRA adapters: rank={lora_cfg.rank}, alpha={lora_cfg.alpha}, "
+                     f"target_modules={target_modules}, modules_to_save={modules_to_save}")
+        policy.model = get_peft_model(policy.model, lora_config)
+    else:
+        logger.warning("No LoRA config found in cfg, loading as base model")
+
+    # Step 3: Load checkpoint weights
     ckpt = Path(ckpt_path)
     if ckpt.is_dir():
         # New format: directory with model.pt + dataset_stats.json
-        policy, stats = load_checkpoint_for_eval(ckpt_path, policy, device="cpu")
+        state_dict = torch.load(ckpt / "model.pt", map_location="cpu", weights_only=True)
+        stats = load_dataset_stats_from_json(ckpt / "dataset_stats.json")
     else:
         # Legacy format: single .pt file
         state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-        if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
-            policy.load_state_dict(state_dict["model_state_dict"], strict=True)
-        else:
-            # Bare state_dict (no wrapper)
-            policy.load_state_dict(state_dict, strict=True)
-        # Find dataset_stats.json: same location as new-format checkpoints
-        stats_path = ckpt.parent.parent / "dataset_stats.json"
-        if not stats_path.exists():
-            # Try other common locations
-            for candidate in [
-                ckpt.parent / "dataset_stats.json",
-                ckpt.parent.parent.parent / "dataset_stats.json",
-            ]:
-                if candidate.exists():
-                    stats_path = candidate
-                    break
-        stats = load_dataset_stats_from_json(stats_path)
+        # Find dataset_stats.json
+        stats_path = None
+        for candidate in [
+            ckpt.parent.parent / "dataset_stats.json",
+            ckpt.parent / "dataset_stats.json",
+            ckpt.parent.parent.parent / "dataset_stats.json",
+        ]:
+            if candidate.exists():
+                stats_path = candidate
+                break
+        stats = load_dataset_stats_from_json(stats_path) if stats_path else {}
+
+    # Handle both wrapped and bare state_dict formats
+    if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+        state_dict = state_dict["model_state_dict"]
+
+    # Strip "model." prefix if present (GalaxeaZeroPolicy wraps GalaxeaZero as self.model)
+    # The checkpoint saves policy.state_dict() which has "model.xxx" keys,
+    # but after get_peft_model, policy.model is a PeftModel, so state_dict keys
+    # are "model.base_model.model.xxx" — which matches what we need.
+    load_result = policy.load_state_dict(state_dict, strict=False)
+    if load_result.missing_keys:
+        logger.warning(f"Missing keys ({len(load_result.missing_keys)}): {load_result.missing_keys[:5]}...")
+    if load_result.unexpected_keys:
+        logger.warning(f"Unexpected keys ({len(load_result.unexpected_keys)}): {load_result.unexpected_keys[:5]}...")
 
     policy = policy.to(device).eval()
 
