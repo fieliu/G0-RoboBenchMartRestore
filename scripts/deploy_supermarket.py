@@ -60,25 +60,18 @@ VALID_TYPES = list(TASK_FAMILY_MAP.keys())
 
 
 class JudgeVerdict(enum.Enum):
-    """What the VLM reports when a sensor trigger fires mid-subtask. The verdict
-    drives the scheduler state machine (see Scheduler._step_subtask):
-      IN_PROGRESS  world matches expectation, not at the terminal state yet
-                   -> change NOTHING, let the VLA keep running this subtask
-      SUCCESS      terminal state reached (item in basket / on shelf)
-                   -> advance to the NEXT subtask (instruction changes)
-      RETRY        failed but world is intact (grasp slipped, item still there)
-                   -> reset the executor and re-run the SAME subtask
-      REPLAN       failed AND world state breaks the remaining plan
-                   (item on the floor, not where the next subtask assumes)
-                   -> ask the VLM for a fresh plan from the current state
-      ABORT        unrecoverable (collision, out of reach, scene changed)
-                   -> stop; open-loop fallback treats this as task failure
+    """VLM Judge only answers: "is the subtask done?"
+    Complex recovery decisions (retry / replan / abort) are handled by the
+    Scheduler based on context (retry count, replan budget, etc.), not by VLM.
+
+      IN_PROGRESS  subtask not yet at terminal state -> keep running
+      SUCCESS      terminal state reached -> advance to next subtask
+      FAIL         subtask failed (grasp slipped, item dropped, etc.)
+                   -> Scheduler decides: retry, replan, or abort
     """
     IN_PROGRESS = "in_progress"
     SUCCESS = "success"
-    RETRY = "retry"
-    REPLAN = "replan"
-    ABORT = "abort"
+    FAIL = "fail"
 
 
 @dataclass
@@ -158,28 +151,23 @@ Manipulation (executed by a VLA policy):
   pick_to_basket           Pick an item from a shelf into the robot's basket.
   restock_basket_to_shelf  Take an item from the basket, place it on a shelf layer.
   pick_from_floor          Pick a fallen item from the floor onto a shelf.
-Navigation (executed by a local planner that avoids obstacles within a segment):
-  navigate_to              Drive in a STRAIGHT LINE to ONE waypoint. target = "x,y".
+Navigation (executed AUTONOMOUSLY by the nav module — global A* path + local obstacle avoidance):
+  navigate_to              Drive to a target SHELF. target = the shelf id (e.g. "C-C0",
+                           "CS-1"). The nav module computes the collision-free route by
+                           itself — you do NOT plan waypoints or read pixels.
   turn_to                  Rotate in place to an absolute heading. target = degrees
                            (0=east, 90=north, 180=west, 270=south).
 
 === RULES ===
 1. type MUST be one of: pick_to_basket, restock_basket_to_shelf, pick_from_floor,
    navigate_to, turn_to.
-2. NAVIGATION IS MULTI-SEGMENT. Each navigate_to covers ONE straight segment
-   between adjacent waypoints. To travel far, emit a CHAIN of navigate_to:
-   current -> waypoint1 -> waypoint2 -> shelf_approach_point.
-   Pick the waypoint sequence from the listed CORRIDOR WAYPOINTS so consecutive
-   points are roughly in a straight line (no diagonal cutting through shelves).
-3. navigate_to targets MUST be exact "x,y" taken from the listed waypoints or
-   shelf approach points. Never invent coordinates.
-4. The local planner turns as needed WHILE driving a segment. Do NOT insert
-   turn_to between two navigate_to commands.
-5. Use turn_to ONLY after arriving at a shelf approach point, to face the shelf
-   for manipulation (target = that approach point's face degrees).
-6. Before any manipulation the robot must be at the shelf's approach point AND
-   facing it.
-7. Output ONLY a JSON array. No prose, no markdown fences.
+2. You do NOT plan routes. For navigation, emit a SINGLE navigate_to per destination
+   with target = the shelf id. The nav module handles global path + obstacle avoidance.
+3. Use the SHELF INVENTORY to find which shelf holds the target item, and which shelf
+   is the destination. Emit navigate_to with that shelf's id as the target.
+4. Before any manipulation the robot must first navigate_to that shelf. After arrival
+   the nav module AUTOMATICALLY faces the shelf — do NOT emit turn_to for this.
+5. Output ONLY a JSON array. No prose, no markdown fences.
 
 Each subtask object has keys: "type", "instruction", "target"."""
 
@@ -189,32 +177,37 @@ USER_TMPL = """{map_block}
 {command}
 
 Decompose the command into the full subtask sequence from the robot's current
-position. Remember: navigation is a CHAIN of straight navigate_to segments
-between adjacent waypoints. Output ONLY the JSON array."""
+position. For navigation emit ONE navigate_to per destination with target = the
+shelf id (the nav module plans the route and avoids obstacles itself — do NOT emit
+waypoints or pixel coordinates). Output ONLY the JSON array."""
 
 # Judge prompt: called when a cheap sensor trigger fires mid-subtask. The VLM
 # looks at the head camera BEFORE/AFTER frames and decides the verdict that
 # drives the scheduler state machine.
-JUDGE_SYSTEM_PROMPT = """You verify a retail robot's subtask from two head-camera frames
-(BEFORE and AFTER a short action burst). Report ONE verdict — be conservative.
+JUDGE_SYSTEM_PROMPT = """You verify a retail robot's subtask from camera frames.
+You receive 3 images in this order:
+  1. Head camera BEFORE the action (reference for what changed)
+  2. Head camera AFTER the action
+  3. Left wrist camera AFTER the action (shows gripper state)
+
+For manipulation tasks (pick/place), the wrist camera is CRITICAL — it shows
+whether the gripper actually holds or released the item. The head camera alone
+may miss fine-grained gripper state.
 
 verdict (use these EXACT strings):
-  in_progress  The robot is still doing the subtask correctly; the terminal
-               goal is NOT yet reached. (Most common — default to this.)
-  success      The subtask's terminal goal IS achieved
-               (item is in the basket / placed on the shelf).
-  retry        It failed but the scene is intact and the SAME subtask can be
-               retried (e.g. grasp slipped, but the item is still in place).
-  replan       It failed AND the world changed so the remaining plan no longer
-               holds (e.g. the item fell on the floor).
-  abort        Unrecoverable (collision, item gone, robot stuck, out of reach).
+  in_progress  The subtask's terminal goal is NOT yet reached.
+               The robot is still working correctly. (Most common — default to this.)
+  success      The subtask's terminal goal IS achieved.
+               For pick: wrist cam shows item secured in gripper / basket.
+               For place: wrist cam shows item released on shelf surface.
+  fail         The subtask failed (grasp slipped, item dropped, wrong action, etc.)
 
 Output ONLY JSON: {"verdict": "...", "reason": "<short>"}"""
 
 JUDGE_USER_TMPL = """High-level goal: {coarse_task}
 Current subtask: {subtask}
-The two images are the head camera BEFORE and AFTER a short action burst.
-Has this subtask reached its terminal goal, or what went wrong?
+Images: head_before, head_after, left_wrist_after.
+Has this subtask reached its terminal goal?
 Output ONLY the JSON verdict."""
 # --- section: planner ---
 
@@ -223,11 +216,15 @@ Output ONLY the JSON verdict."""
 # 4. VLM planner — ONE call, returns the whole subtask sequence
 # ============================================================
 class VLMPlanner:
-    def __init__(self, provider: str = "qwen", api_key: str = "", model: str = ""):
+    def __init__(self, provider: str = "qwen", api_key: str = "", model: str = "",
+                 base_url: str = ""):
         self.provider = provider.lower()
         self.api_key = api_key or os.environ.get("VLM_API_KEY", "")
+        self.base_url = base_url or os.environ.get("VLM_BASE_URL", "")
         self.model = model or {"qwen": "qwen-vl-max", "gemini": "gemini-2.0-flash",
-                               "openai": "gpt-4o"}.get(self.provider, "qwen-vl-max")
+                               "openai": "gpt-4o",
+                               "openai_compatible": "qwen-vl-max",
+                               "anthropic": "claude-sonnet-4-5"}.get(self.provider, "qwen-vl-max")
         self._init_client()
 
     def _init_client(self):
@@ -237,6 +234,20 @@ class VLMPlanner:
             base_url = {"gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
                         "openai": None}[self.provider]
             self.client = openai.OpenAI(api_key=self.api_key, base_url=base_url)
+        elif self.provider == "openai_compatible":
+            import openai
+            if not self.base_url:
+                raise ValueError("--vlm-base-url is required for openai_compatible provider")
+            self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
+        elif self.provider == "anthropic":
+            import anthropic
+            # Native Anthropic Messages API. For PackyCode use
+            # --vlm-base-url https://api.packycode.com  (NO /v1 suffix; the SDK
+            # appends /v1/messages itself). Omit base_url to hit Anthropic direct.
+            kwargs = {"api_key": self.api_key}
+            if self.base_url:
+                kwargs["base_url"] = self.base_url
+            self.client = anthropic.Anthropic(**kwargs)
         elif self.provider == "qwen":
             try:
                 from dashscope import MultiModalConversation
@@ -251,12 +262,16 @@ class VLMPlanner:
         return self._parse(raw)
 
     def judge(self, coarse_task: str, subtask: str,
-              before: Optional[np.ndarray], after: Optional[np.ndarray]) -> "JudgeVerdict":
-        """Verify a subtask from head-camera BEFORE/AFTER frames. Returns a
-        JudgeVerdict. On any error or unparseable reply, defaults to IN_PROGRESS
-        (conservative: change nothing rather than wrongly advance/abort)."""
+              head_before: Optional[np.ndarray] = None,
+              head_after: Optional[np.ndarray] = None,
+              left_wrist_after: Optional[np.ndarray] = None) -> "JudgeVerdict":
+        """Verify a subtask from 3 images: head_before, head_after, left_wrist_after.
+        VLM only answers "is the subtask done?" — returns IN_PROGRESS / SUCCESS / FAIL.
+        Recovery decisions (retry / replan / abort) are handled by the Scheduler.
+        On any error defaults to IN_PROGRESS (conservative: keep running)."""
         user = JUDGE_USER_TMPL.format(coarse_task=coarse_task, subtask=subtask)
-        imgs = [im for im in (before, after) if im is not None]
+        imgs = [im for im in (head_before, head_after, left_wrist_after)
+                if im is not None]
         try:
             raw = self._call(user, imgs, system=JUDGE_SYSTEM_PROMPT)
             return self._parse_verdict(raw)
@@ -285,8 +300,10 @@ class VLMPlanner:
         images = image if isinstance(image, list) else ([] if image is None else [image])
         if self.provider == "qwen" and self.client is not None:
             return self._call_qwen(prompt, images, system)
-        if self.provider in ("gemini", "openai") and self.client is not None:
+        if self.provider in ("gemini", "openai", "openai_compatible") and self.client is not None:
             return self._call_openai(prompt, images, system)
+        if self.provider == "anthropic" and self.client is not None:
+            return self._call_anthropic(prompt, images, system)
         raise RuntimeError(f"VLM provider '{self.provider}' has no usable client")
 # --- section: planner-api ---
 
@@ -322,6 +339,28 @@ class VLMPlanner:
                       {"role": "user", "content": content}],
         )
         return resp.choices[0].message.content
+
+    def _call_anthropic(self, prompt: str, images: List[np.ndarray], system: str) -> str:
+        # Native Anthropic Messages API: system is a TOP-LEVEL param (not a
+        # message), and images use source.base64 blocks rather than image_url.
+        content = []
+        for im in images:
+            content.append({"type": "image",
+                            "source": {"type": "base64", "media_type": "image/jpeg",
+                                       "data": self._encode(im)}})
+        content.append({"type": "text", "text": prompt})
+        resp = self.client.messages.create(
+            model=self.model, max_tokens=1024, temperature=0.1,
+            system=system,
+            messages=[{"role": "user", "content": content}],
+        )
+        # 取第一个文本块: 模型可能返回 ToolUseBlock 等非文本块在前, 不能直接 [0].text
+        for block in resp.content:
+            if getattr(block, "type", None) == "text":
+                return block.text
+            if hasattr(block, "text"):
+                return block.text
+        return ""
 
     def _parse(self, raw: str) -> List[Subtask]:
         import re
@@ -426,26 +465,192 @@ class VLAExecutor:
 
 
 class NavExecutor:
-    """Point-goal navigation for ONE straight segment. The local planner
-    (NavDP / iPlanner / Nav2) drives to the goal (x, y), turning and avoiding
-    obstacles within the segment, then reports arrival. We hand it one goal
-    coordinate per navigate_to subtask and poll arrival."""
+    """Point-goal navigation for ONE straight segment.
 
-    def __init__(self, device: str = "cuda", ckpt: str = ""):
+    Supports two backends:
+      - 'navdp':  NavDP diffusion policy (needs RGB + depth, stateful)
+      - 'motionplanner': FetchMotionPlanningSapienSolver from RoboBenchMart
+      - 'mock':   no-op (for simulate mode)
+
+    The local planner drives to the goal (x, y), turning and avoiding
+    obstacles within the segment, then reports arrival.
+    """
+
+    def __init__(self, backend: str = "mock", device: str = "cuda",
+                 navdp_ckpt: str = "", env=None):
+        self.backend = backend
         self.device = device
-        self.ckpt = ckpt
-        logger.info("Nav: point-goal executor ready (one straight segment per call)")
+        self.controller = None
+        self._goal_world = None
+        self._arrived = False
+        self._step_count = 0
+        self._max_nav_steps = 600   # safety timeout
+        # 终点朝向: 导航模块到达 approach 位置后, 自动转到货架 face_deg(不靠 VLM)
+        self.shelf_approach: Dict[str, Dict] = {}
+        self._face_deg = None          # 目标朝向(度); None=不需对齐
+        self._reached_pos = False      # 位置已到(尚未对齐朝向)
+        self._aligned = False          # 朝向已对齐
+        self._yaw_kp, self._yaw_kd, self._yaw_prev = 1.5, 0.3, 0.0
+
+        if backend == "navdp" and navdp_ckpt:
+            sys.path.append("/home/lh/VLA/RoboBenchMart-main")
+            from dsynth.navigation.navdp_controller import NavDPController
+            self.controller = NavDPController(
+                model_path=navdp_ckpt, device=device,
+            )
+            logger.info(f"Nav: NavDP controller loaded from {navdp_ckpt}")
+        elif backend == "motionplanner" and env is not None:
+            sys.path.append("/home/lh/VLA/RoboBenchMart-main")
+            from dsynth.planning.motionplanner import FetchMotionPlanningSapienSolver
+            unwrapped = env.unwrapped if hasattr(env, 'unwrapped') else env
+            self.controller = FetchMotionPlanningSapienSolver(unwrapped)
+            logger.info("Nav: MotionPlanner controller loaded")
+        else:
+            logger.info("Nav: mock controller (no-op)")
+
+    def reset(self):
+        """Reset navigation state for a new segment."""
+        self._goal_world = None
+        self._arrived = False
+        self._step_count = 0
+        if self.controller is not None and hasattr(self.controller, 'reset'):
+            self.controller.reset()
 
     def set_goal(self, obs_provider, target: str) -> np.ndarray:
-        x, y = [float(v) for v in target.split(",")]
-        env = getattr(obs_provider, "__self__", None)
+        # target 可为货架 id(如 "C-C0")或 "x,y"。货架 id -> 查 approach 位置 + face_deg,
+        # 到达位置后由导航模块自动转到 face_deg(终点朝向不靠 VLM)。
+        self._face_deg = None
+        info = self.shelf_approach.get(target)
+        if info is not None:
+            x, y = float(info["pos"][0]), float(info["pos"][1])
+            self._face_deg = float(info.get("face_deg")) if info.get("face_deg") is not None else None
+        else:
+            x, y = [float(v) for v in target.split(",")]
+        self._goal_world = np.array([x, y, 0.0])
+        self._arrived = False
+        self._reached_pos = False
+        self._aligned = False
+        self._yaw_prev = 0.0
+        self._step_count = 0
+        # Support both bound methods and callable objects
+        env = getattr(obs_provider, "__self__", None) or (
+            obs_provider if hasattr(obs_provider, "set_nav_goal") else None
+        )
         if env is not None and hasattr(env, "set_nav_goal"):
             env.set_nav_goal(np.array([x, y]))
+        if self.controller is not None and hasattr(self.controller, 'reset'):
+            self.controller.reset()
         return np.array([x, y])
 
     def act(self, subtask: Subtask, obs: Dict) -> np.ndarray:
-        # Real deployment: the nav node drives the base. Here: no-op step.
+        """Compute navigation action for one step."""
+        self._step_count += 1
+
+        # 阶段2: 位置已到, 由导航模块把朝向对齐到货架 face_deg(不靠 VLM 发 turn_to)
+        if self._reached_pos and self._face_deg is not None and not self._aligned:
+            target = np.radians(self._face_deg)
+            cur = float(obs.get("robot_yaw", 0.0))
+            err = (target - cur + np.pi) % (2 * np.pi) - np.pi
+            if abs(err) < np.radians(5.0):       # 朝向到位
+                self._aligned = True
+                self._arrived = True
+                return np.zeros((16, 15), dtype=np.float32)
+            omega = float(np.clip(self._yaw_kp * err + self._yaw_kd * (err - self._yaw_prev),
+                                  -1.0, 1.0))
+            self._yaw_prev = err
+            a = np.zeros((16, 15), dtype=np.float32)
+            a[:, 2] = omega                       # base_yaw channel
+            return a
+
+        # 阶段1: 驱动到 approach 位置
+        if self._check_arrival(obs):
+            self._reached_pos = True
+            if self._face_deg is None:            # 无需对齐朝向 -> 直接完成
+                self._arrived = True
+                return np.zeros((16, 15), dtype=np.float32)
+            self._yaw_prev = 0.0                  # 进入对齐阶段, 清 PD 状态
+            return np.zeros((16, 15), dtype=np.float32)
+
+        # Safety timeout
+        if self._step_count > self._max_nav_steps:
+            logger.warning(f"Nav: max steps ({self._max_nav_steps}) reached, forcing arrival")
+            self._arrived = True
+            return np.zeros((16, 15), dtype=np.float32)
+
+        if self.backend == "navdp" and self.controller is not None:
+            return self._act_navdp(obs)
+        elif self.backend == "motionplanner" and self.controller is not None:
+            return self._act_motionplanner(obs)
+        else:
+            return np.zeros((16, 15), dtype=np.float32)
+
+    def _check_arrival(self, obs: Dict) -> bool:
+        if obs.get("nav_arrived") is True:
+            return True
+        if self._goal_world is not None:
+            cur = np.asarray(obs.get("robot_position", [0.0, 0.0, 0.0]))[:2]
+            goal = self._goal_world[:2]
+            return float(np.linalg.norm(cur - goal)) < 0.3
+        return False
+
+    def _act_navdp(self, obs: Dict) -> np.ndarray:
+        """NavDP: plan trajectory then pure-pursuit control."""
+        import torch as _torch
+
+        # Get robot pose matrix
+        robot_pose = obs.get("robot_pose_matrix")
+        if robot_pose is None:
+            return np.zeros((16, 15), dtype=np.float32)
+
+        # Compute goal in robot frame
+        goal_world = np.array([self._goal_world[0], self._goal_world[1], 0.0])
+        goal_robot = self.controller.compute_goal_in_robot_frame(goal_world, robot_pose)
+
+        # Get depth image
+        depth = obs.get("depth")
+        head_rgb = obs.get("head_rgb_raw")
+        if depth is None or head_rgb is None:
+            return np.zeros((16, 15), dtype=np.float32)
+
+        # Plan (every step for NavDP since it's stateful)
+        try:
+            self.controller.plan(head_rgb, depth, goal_robot, robot_pose)
+        except Exception as e:
+            logger.warning(f"NavDP plan failed: {e}")
+            return np.zeros((16, 15), dtype=np.float32)
+
+        # Check if NavDP says stop
+        if self.controller.is_stopped:
+            logger.info("Nav: NavDP reports no safe path (stopped)")
+            self._arrived = True
+            return np.zeros((16, 15), dtype=np.float32)
+
+        # Pure-pursuit velocity
+        linear_vel, angular_vel = self.controller.compute_base_velocity(robot_pose)
+
+        # Convert to Fetch 15-DoF action
+        action = np.zeros((16, 15), dtype=np.float32)
+        action[:, 0] = linear_vel    # base_x velocity
+        action[:, 2] = angular_vel   # base_yaw velocity
+        return action
+
+    def _act_motionplanner(self, obs: Dict) -> np.ndarray:
+        """MotionPlanner: use drive_base for the whole segment at once."""
+        # MotionPlanner drives the base directly via env.step(),
+        # so we signal arrival after one call (it's blocking).
+        # This is handled differently — see apply_action integration.
+        if self._step_count == 1 and self._goal_world is not None:
+            try:
+                target_pos = self._goal_world.copy()
+                self.controller.drive_base(target_pos=target_pos[:3])
+            except Exception as e:
+                logger.warning(f"MotionPlanner drive_base failed: {e}")
+            self._arrived = True
         return np.zeros((16, 15), dtype=np.float32)
+
+    @property
+    def arrived(self) -> bool:
+        return self._arrived
 
 
 class TurnExecutor:
@@ -512,6 +717,10 @@ class Scheduler:
         pose = self._pose(obs_provider)
         map_block = self.map.render(pose["xy"], pose["yaw_deg"])
 
+        # 把货架 approach 数据(pos + face_deg)交给导航模块: navigate_to 的 target 是
+        # 货架 id, 由导航模块查坐标、走 A*、到位后自动转到 face_deg(终点朝向不靠 VLM)。
+        self.nav.shelf_approach = self.map.shelf_approach
+
         # The full human command is the high-level goal for the VLA executor.
         # G0 was trained on "[High]: {coarse_task}, [Low]: {task}", so feeding
         # the command here lets each subtask inherit the overall intent.
@@ -519,14 +728,16 @@ class Scheduler:
 
         logger.info("=" * 64)
         logger.info(f"COMMAND: {command}")
-        plan = self.vlm.plan(command, map_block, obs_provider().get("head_rgb_raw"))
+        plan = self.vlm.plan(command, map_block)
         if not plan:
             return {"command": command, "status": "failed", "reason": "empty plan"}
         self._log_plan(plan)
 
-        # State machine over the subtask sequence. A VLA subtask's VLM judge can
-        # return RETRY (re-run same subtask), REPLAN (regenerate the remaining
-        # plan from current state), or ABORT (give up). Nav/turn never judge.
+        # State machine over the subtask sequence. VLM Judge returns only
+        # IN_PROGRESS / SUCCESS / FAIL. The Scheduler decides recovery:
+        #   FAIL + retries left  -> RETRY (re-run same subtask)
+        #   FAIL + retries exhausted + replans left -> REPLAN
+        #   FAIL + all budgets exhausted -> ABORT
         completed = 0
         replans = 0
         i = 0
@@ -538,35 +749,34 @@ class Scheduler:
             if verdict is JudgeVerdict.SUCCESS:
                 subtask.status = "completed"
                 completed += 1
+
+                # 导航不再让 VLM 介入: 子任务规划好后, 全局路径(A*)+ 局部避障由
+                # 导航模块自动处理。VLM 只负责高层规划(理解意图、拆子任务、选目标),
+                # 不在到达每个路点后重规划路线。
                 i += 1
                 continue
 
-            if verdict is JudgeVerdict.RETRY:
+            if verdict is JudgeVerdict.FAIL:
+                # Scheduler decides recovery based on context, not VLM
                 if subtask.retries < self.max_retries:
                     subtask.retries += 1
-                    logger.warning(f"  RETRY {subtask.retries}/{self.max_retries}: {subtask.instruction}")
+                    logger.warning(f"  FAIL -> RETRY {subtask.retries}/{self.max_retries}: {subtask.instruction}")
                     continue                              # same i: re-run this subtask
-                logger.error(f"  retries exhausted -> failing: {subtask.instruction}")
-                subtask.status = "failed"
-                return self._summary(command, "failed", plan, completed)
-
-            if verdict is JudgeVerdict.REPLAN:
                 if replans < self.max_replans:
                     replans += 1
-                    logger.warning(f"  REPLAN {replans}/{self.max_replans} from current state")
+                    logger.warning(f"  FAIL (retries exhausted) -> REPLAN {replans}/{self.max_replans}")
                     pose = self._pose(obs_provider)
-                    fresh = self.vlm.plan(command, self.map.render(pose["xy"], pose["yaw_deg"]),
-                                          obs_provider().get("head_rgb_raw"))
+                    fresh = self.vlm.plan(command, self.map.render(pose["xy"], pose["yaw_deg"]))
                     if fresh:
                         plan = plan[:i] + fresh           # keep done prefix, swap the rest
                         self._log_plan(plan)
                         continue                          # same i: start of the new tail
-                logger.error("  replan budget exhausted (or empty plan) -> failing")
+                logger.error(f"  FAIL (all budgets exhausted) -> ABORT: {subtask.instruction}")
                 subtask.status = "failed"
                 return self._summary(command, "failed", plan, completed)
 
-            # ABORT (includes max_steps timeout)
-            logger.error(f"  ABORT: {subtask.instruction}")
+            # Should not reach here, but defensive
+            logger.error(f"  unexpected verdict: {verdict}")
             subtask.status = "failed"
             return self._summary(command, "failed", plan, completed)
 
@@ -587,7 +797,10 @@ class Scheduler:
         else:
             executor, is_vla = self.vla, True
 
-        env = getattr(obs_provider, "__self__", None)
+        # Support both bound methods (SimEnv.get_obs) and callable objects (RealEnvObsProvider)
+        env = getattr(obs_provider, "__self__", None) or (
+            obs_provider if hasattr(obs_provider, "apply_action") else None
+        )
         if env is not None and hasattr(env, "set_subtask"):
             env.set_subtask(subtask)
 
@@ -596,7 +809,7 @@ class Scheduler:
         judging = is_vla and self.use_vlm_judge and self.judge_fn is not None
         step, last_judge = 0, 0
         obs = obs_provider()
-        before = obs.get("head_rgb_raw") if judging else None
+        head_before = obs.get("head_rgb_raw") if judging else None
 
         # Receding horizon: VLA infers once, executes `replan_steps` of its chunk,
         # then re-infers (matches eval_libero.py). Nav/turn re-infer every step.
@@ -614,17 +827,20 @@ class Scheduler:
                         return JudgeVerdict.SUCCESS
                     if step - last_judge >= self.judge_cooldown:
                         last_judge = step                 # cooldown gate: avoid VLM spam
-                        v = self.judge_fn(self.vla.coarse_task, subtask.instruction,
-                                          before, obs.get("head_rgb_raw"))
+                        v = self.judge_fn(
+                            self.vla.coarse_task, subtask.instruction,
+                            head_before, obs.get("head_rgb_raw"),
+                            obs.get("left_wrist_rgb_raw"),
+                        )
                         logger.info(f"  trigger@{step} -> judge={v.value}")
                         if v is JudgeVerdict.IN_PROGRESS:
-                            before = obs.get("head_rgb_raw")   # refresh baseline, keep going
+                            head_before = obs.get("head_rgb_raw")
                         else:
-                            return v                      # SUCCESS / RETRY / REPLAN / ABORT
+                            return v                      # SUCCESS or FAIL
                 if step >= subtask.max_steps:
                     break
-        logger.warning(f"  hit max_steps ({subtask.max_steps}) -> ABORT")
-        return JudgeVerdict.ABORT
+        logger.warning(f"  hit max_steps ({subtask.max_steps}) -> FAIL")
+        return JudgeVerdict.FAIL
 # --- section: scheduler-done ---
 
     # ---- cheap sensor TRIGGER (no VLM). For nav/turn it IS the done signal;
@@ -642,9 +858,31 @@ class Scheduler:
             tgt = np.radians(float(subtask.target))
             return abs(TurnExecutor._wrap(tgt - cur)) < np.radians(5)
         if t in ("pick_to_basket", "pick_from_floor"):
-            return bool(obs.get("gripper_closed", False))
+            # Key checkpoint: gripper must be closed AND arm must have moved
+            # toward the shelf (not just closed in rest position).
+            gripper_closed = bool(obs.get("gripper_closed", False))
+            if not gripper_closed:
+                return False
+            # Additional check: arm is not in rest position
+            # (joint values significantly different from zero/home)
+            qpos = obs.get("state", {}).get("default", None)
+            if qpos is not None:
+                arm_joints = np.asarray(qpos)[3:10]  # arm joints (indices 3-9)
+                arm_moved = float(np.linalg.norm(arm_joints)) > 0.3
+                return arm_moved
+            return gripper_closed  # fallback if no state
         if t == "restock_basket_to_shelf":
-            return bool(obs.get("gripper_open", False))
+            # Key checkpoint: gripper must be open AND arm must have reached
+            # toward the shelf (not just opened at rest).
+            gripper_open = bool(obs.get("gripper_open", False))
+            if not gripper_open:
+                return False
+            qpos = obs.get("state", {}).get("default", None)
+            if qpos is not None:
+                arm_joints = np.asarray(qpos)[3:10]
+                arm_moved = float(np.linalg.norm(arm_joints)) > 0.3
+                return arm_moved
+            return gripper_open
         return False
 
     # ---- helpers ----
@@ -661,11 +899,239 @@ class Scheduler:
         return {"command": command, "status": status,
                 "completed": completed, "total": len(plan),
                 "plan": [s.to_dict() for s in plan]}
-# --- section: simenv ---
+# --- section: realenv ---
 
 
 # ============================================================
-# 7. Simulated environment (test the loop without a real robot)
+# 7a. Real RoboBenchMart environment obs provider
+#     Integrates StoreMapProvider for VLM planning with top-down map.
+# ============================================================
+class RealEnvObsProvider:
+    """Bridges RoboBenchMart simulation environment to the Scheduler.
+
+    - Uses StoreMapProvider to auto-extract top-down map, shelf inventory,
+      and coordinate table from the simulation environment.
+    - Only the robot position is updated in real-time; the static map
+      (shelf labels, waypoints, coordinates) is built once at init.
+    - Provides obs dict compatible with Scheduler/VLAExecutor/NavExecutor.
+    """
+
+    def __init__(self, env, camera_height: float = 8.0, image_size: int = 1024):
+        """
+        Args:
+            env: ManiSkill gym environment from RoboBenchMart.
+            camera_height: Height for top-down camera (meters).
+            image_size: Resolution of top-down image.
+        """
+        import sys
+        sys.path.append("/home/lh/VLA/RoboBenchMart-main")
+        from dsynth.navigation.map_utils import StoreMapProvider
+
+        self.env = env.unwrapped if hasattr(env, 'unwrapped') else env
+        self.map_provider = StoreMapProvider(
+            self.env, camera_height=camera_height, image_size=image_size
+        )
+        self.map_provider.initialize()
+        self._nav_goal = np.array([0.0, 0.0])
+
+        # Discover sensor names from environment (avoid hardcoding)
+        self._sensor_names = self._discover_sensors()
+
+    # ---- Scheduler hooks ----
+    def set_subtask(self, subtask: Subtask):
+        pass  # could be used for logging
+
+    def set_nav_goal(self, goal: np.ndarray):
+        self._nav_goal = goal.copy()
+
+    def _discover_sensors(self) -> Dict[str, str]:
+        """Discover sensor names from the environment to avoid hardcoding.
+
+        Returns dict mapping logical role -> actual sensor name:
+          head_camera, left_wrist_camera, right_wrist_camera
+        """
+        names = {}
+        try:
+            sensor_data = self.env.scene.get_sensor_data()
+            all_keys = list(sensor_data.keys()) if isinstance(sensor_data, dict) else []
+            logger.info(f"Available sensors: {all_keys}")
+
+            # Head camera: look for base_camera, render_camera, or any camera
+            # that is NOT a hand/wrist camera
+            for k in all_keys:
+                k_lower = k.lower()
+                if 'hand' in k_lower or 'wrist' in k_lower or 'gripper' in k_lower:
+                    continue
+                if 'camera' in k_lower or 'rgb' in k_lower:
+                    names.setdefault('head_camera', k)
+                    break
+
+            # Hand/wrist cameras
+            for k in all_keys:
+                k_lower = k.lower()
+                if 'hand' in k_lower or 'wrist' in k_lower or 'gripper' in k_lower:
+                    if 'left' not in names.values() and 'right' not in names.values():
+                        names.setdefault('left_wrist_camera', k)
+                    else:
+                        names.setdefault('right_wrist_camera', k)
+
+            # Fallbacks for common ManiSkill sensor names
+            if 'head_camera' not in names:
+                for candidate in ['left_base_camera_link', 'base_camera',
+                                  'render_camera', 'fetch_head']:
+                    if candidate in all_keys:
+                        names['head_camera'] = candidate
+                        break
+            if 'left_wrist_camera' not in names:
+                for candidate in ['fetch_hand', 'hand_camera', 'left_hand_camera',
+                                  'left_wrist_camera']:
+                    if candidate in all_keys:
+                        names['left_wrist_camera'] = candidate
+                        break
+            if 'right_wrist_camera' not in names:
+                for candidate in ['right_hand_camera', 'right_wrist_camera',
+                                  'fetch_right_hand']:
+                    if candidate in all_keys:
+                        names['right_wrist_camera'] = candidate
+                        break
+
+        except Exception as e:
+            logger.warning(f"Sensor discovery failed: {e}")
+
+        logger.info(f"Mapped sensors: {names}")
+        return names
+
+    def apply_action(self, action: np.ndarray):
+        """Apply action to the simulation environment."""
+        action = np.asarray(action).flatten()
+        if len(action) >= 15:
+            full_action = action[:15]
+        elif len(action) >= 2:
+            full_action = np.zeros(15, dtype=np.float32)
+            full_action[0] = action[0]  # base_x
+            full_action[2] = action[1] if len(action) > 1 else 0.0  # base_yaw
+        else:
+            return
+        try:
+            obs, reward, terminated, truncated, info = self.env.step(full_action)
+            if terminated or truncated:
+                logger.warning("Episode ended (terminated/truncated), resetting")
+                self.env.reset()
+        except Exception as e:
+            logger.warning(f"env.step failed: {e}")
+
+    # ---- Main obs interface ----
+    def __call__(self) -> Dict:
+        """Return obs dict compatible with Scheduler."""
+        return self.get_obs()
+
+    def get_obs(self) -> Dict:
+        """Get current observation from the simulation environment."""
+        import torch
+
+        # Sensor data from ManiSkill
+        sensor_data = self.env.scene.get_sensor_data()
+
+        # RGB images
+        head_rgb_raw = None
+        left_wrist_rgb_raw = None
+        right_wrist_rgb_raw = None
+        depth_raw = None
+
+        # Head camera
+        head_key = self._sensor_names.get('head_camera')
+        if head_key and head_key in sensor_data:
+            try:
+                cam = sensor_data[head_key]
+                head_rgb_raw = cam['rgb'][0].cpu().numpy()  # (H, W, 3)
+                if 'depth' in cam:
+                    depth_raw = cam['depth'][0, :, :, 0].cpu().numpy()  # (H, W)
+            except Exception as e:
+                logger.warning(f"Failed to read head camera ({head_key}): {e}")
+
+        # Left wrist camera
+        left_key = self._sensor_names.get('left_wrist_camera')
+        if left_key and left_key in sensor_data:
+            try:
+                left_wrist_rgb_raw = sensor_data[left_key]['rgb'][0].cpu().numpy()
+            except Exception as e:
+                logger.warning(f"Failed to read left wrist camera ({left_key}): {e}")
+
+        # Right wrist camera
+        right_key = self._sensor_names.get('right_wrist_camera')
+        if right_key and right_key in sensor_data:
+            try:
+                right_wrist_rgb_raw = sensor_data[right_key]['rgb'][0].cpu().numpy()
+            except Exception as e:
+                logger.warning(f"Failed to read right wrist camera ({right_key}): {e}")
+
+        # Fallback: create dummy images if sensors unavailable
+        if head_rgb_raw is None:
+            head_rgb_raw = np.zeros((360, 640, 3), dtype=np.uint8)
+        if left_wrist_rgb_raw is None:
+            left_wrist_rgb_raw = np.zeros((128, 128, 3), dtype=np.uint8)
+        # Fetch has only one gripper — right wrist is a copy of left wrist
+        right_wrist_rgb_raw = left_wrist_rgb_raw.copy()
+
+        # Robot state
+        robot_pos = self.env.agent.base_link.pose.p[0].cpu().numpy()
+        robot_mat = self.env.agent.base_link.pose.to_transformation_matrix()[0].cpu().numpy()
+        robot_yaw = float(np.arctan2(robot_mat[1, 0], robot_mat[0, 0]))
+
+        # Joint state
+        qpos = self.env.agent.get_qpos()[0].cpu().numpy()
+
+        # Gripper state (last joint of Fetch)
+        gripper_q = qpos[-1] if len(qpos) > 0 else 0.0
+        gripper_closed = gripper_q < 0.01
+        gripper_open = gripper_q > 0.04
+
+        # Resize images for VLA (224x224)
+        try:
+            import cv2
+            head_rgb = cv2.resize(head_rgb_raw, (224, 224)).transpose(2, 0, 1).astype(np.float32) / 255.0
+            left_wrist = cv2.resize(left_wrist_rgb_raw, (224, 224)).transpose(2, 0, 1).astype(np.float32) / 255.0
+            # Fetch has one gripper — right wrist is a copy of left wrist
+            right_wrist = left_wrist.copy()
+        except Exception:
+            head_rgb = np.zeros((3, 224, 224), np.float32)
+            left_wrist = np.zeros((3, 224, 224), np.float32)
+            right_wrist = np.zeros((3, 224, 224), np.float32)
+
+        return {
+            "head_rgb": head_rgb,
+            "left_wrist_rgb": left_wrist,
+            "right_wrist_rgb": right_wrist,
+            "head_rgb_raw": head_rgb_raw,
+            "left_wrist_rgb_raw": left_wrist_rgb_raw,
+            "right_wrist_rgb_raw": right_wrist_rgb_raw,
+            "depth": depth_raw,
+            "state": {"default": qpos.astype(np.float32)},
+            "robot_position": robot_pos,
+            "robot_yaw": robot_yaw,
+            "robot_pose_matrix": robot_mat,
+            "nav_goal": self._nav_goal,
+            "nav_arrived": bool(np.linalg.norm(robot_pos[:2] - self._nav_goal) < 0.3),
+            "gripper_closed": gripper_closed,
+            "gripper_open": gripper_open,
+        }
+
+    # ---- VLM planning helpers ----
+    def get_map_info(self):
+        """Get MapInfo from StoreMapProvider (with updated robot position)."""
+        return self.map_provider.get_map_info()
+
+    def get_vlm_prompt_block(self) -> str:
+        """Get text block for VLM prompt (inventory + coordinates + robot state)."""
+        return self.map_provider.get_vlm_prompt_block()
+
+    def get_vlm_image(self) -> np.ndarray:
+        """Get top-down image with shelf labels and robot position."""
+        return self.map_provider.get_vlm_image()
+
+
+# ============================================================
+# 7b. Simulated environment (test the loop without a real robot)
 # ============================================================
 class SimEnv:
     """Minimal stand-in: drives the active subtask to its done-signal after a
@@ -707,8 +1173,11 @@ class SimEnv:
         return {
             "head_rgb": np.zeros((3, 224, 224), np.float32),
             "left_wrist_rgb": np.zeros((3, 224, 224), np.float32),
+            # Fetch has one gripper — right wrist is a copy of left wrist
             "right_wrist_rgb": np.zeros((3, 224, 224), np.float32),
             "head_rgb_raw": np.zeros((224, 224, 3), np.uint8),
+            "left_wrist_rgb_raw": np.zeros((128, 128, 3), np.uint8),
+            "right_wrist_rgb_raw": np.zeros((128, 128, 3), np.uint8),
             "state": {"default": np.zeros((15,), np.float32)},
             "robot_position": self.pos.copy(),
             "robot_yaw": self.yaw,
@@ -724,34 +1193,109 @@ class SimEnv:
 # 8. Main
 # ============================================================
 def parse_args():
-    p = argparse.ArgumentParser(description="Hierarchical VLM+VLA supermarket deployment (open-loop)")
+    p = argparse.ArgumentParser(description="Hierarchical VLM+VLA supermarket deployment")
     p.add_argument("--command", required=True, help="high-level human command")
-    p.add_argument("--map-file", required=True, help="store map JSON")
-    p.add_argument("--vlm-provider", default="qwen", choices=["qwen", "gemini", "openai"])
+    p.add_argument("--map-file", default="", help="store map JSON (not needed for real_env mode)")
+    p.add_argument("--vlm-provider", default="qwen", choices=["qwen", "gemini", "openai", "openai_compatible"])
     p.add_argument("--vlm-api-key", default="")
     p.add_argument("--vlm-model", default="")
+    p.add_argument("--vlm-base-url", default="",
+                   help="OpenAI-compatible base URL (for openai_compatible provider, e.g. https://api.packy.com/v1)")
     p.add_argument("--vla-ckpt", default="", help="Fetch LoRA checkpoint (empty -> mock)")
     p.add_argument("--no-vlm-judge", action="store_true",
                    help="disable closed-loop VLM completion check (sensor-only, no recovery)")
-    p.add_argument("--mode", default="simulate", choices=["simulate", "real"])
+    p.add_argument("--mode", default="simulate", choices=["simulate", "real_env"],
+                   help="simulate=mock, real_env=RoboBenchMart simulation")
+    p.add_argument("--env-name", default="DarkstoreContinuousBaseEnv",
+                   help="RoboBenchMart environment name (for real_env mode)")
+    p.add_argument("--robot-uids", default="ds_fetch_basket",
+                   help="Robot type: ds_fetch_basket, panda_wristcam, etc.")
+    p.add_argument("--nav-backend", default="mock",
+                   choices=["mock", "navdp", "motionplanner"],
+                   help="Navigation backend")
+    p.add_argument("--navdp-ckpt", default="", help="NavDP checkpoint path")
+    p.add_argument("--scene-dir", default="",
+                   help="RoboBenchMart scene config directory (contains input_config.yaml)")
     p.add_argument("--output", default="")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    store_map = StoreMap.from_file(args.map_file)
-    vlm = VLMPlanner(args.vlm_provider, args.vlm_api_key, args.vlm_model)
+    vlm = VLMPlanner(args.vlm_provider, args.vlm_api_key, args.vlm_model, args.vlm_base_url)
     vla = VLAExecutor(ckpt_path=args.vla_ckpt)
-    nav = NavExecutor()
     turn = TurnExecutor()
-    scheduler = Scheduler(vlm, store_map, vla, nav, turn,
-                          use_vlm_judge=not args.no_vlm_judge)
 
     if args.mode == "simulate":
-        obs_provider = SimEnv(steps_to_done=15).get_obs
+        # Mock mode: uses SimEnv + static map JSON
+        store_map = StoreMap.from_file(args.map_file) if args.map_file else StoreMap({
+            "grid_ascii": "WWWWWWWWWW\nW  W  W  W\nW  W  W  W\n   W  W   \nW  W  W  W\nWWWWWWWWWW",
+            "legend": {"W": "wall/shelf", " ": "corridor"},
+            "waypoints": {"wp_0": [2.0, 1.0], "wp_1": [5.0, 1.0], "wp_2": [5.0, 5.0]},
+            "shelf_approach": {"zone_0_shelf_0": {"pos": [2.0, 1.5], "face_deg": 0}},
+        })
+        sim = SimEnv(steps_to_done=15)
+        nav = NavExecutor(backend="mock")
+        obs_provider = sim.get_obs
+        scheduler = Scheduler(vlm, store_map, vla, nav, turn,
+                              use_vlm_judge=not args.no_vlm_judge)
+
+    elif args.mode == "real_env":
+        # Real RoboBenchMart simulation environment
+        import gymnasium as gym
+        import sys
+        sys.path.append("/home/lh/VLA/RoboBenchMart-main")
+
+        env = gym.make(
+            args.env_name,
+            num_envs=1,
+            obs_mode="rgbd",
+            control_mode="pd_joint_pos",
+            render_mode="rgb_array",
+            robot_uids=args.robot_uids,
+            config_dir_path=args.scene_dir,
+            enable_shadow=False,
+            parallel_in_single_scene=False,
+        )
+        obs, info = env.reset(options={"reconfigure": True})
+
+        # Create RealEnvObsProvider (auto-extracts map from environment)
+        real_env = RealEnvObsProvider(env)
+
+        # Build StoreMap from RealEnvObsProvider's map data
+        map_info = real_env.get_map_info()
+        store_map = StoreMap({
+            "grid_ascii": f"Scene {map_info.scene_size[0]:.1f}x{map_info.scene_size[1]:.1f}m",
+            "legend": {"S": "shelf", " ": "corridor"},
+            "waypoints": {k: v for k, v in map_info.waypoints.items()},
+            "shelf_approach": {
+                name: {"pos": [s.approach_pos[0], s.approach_pos[1]],
+                        "face_deg": s.approach_yaw_deg}
+                for name, s in map_info.shelves.items()
+            },
+        })
+
+        # Create NavExecutor with chosen backend
+        nav = NavExecutor(
+            backend=args.nav_backend,
+            navdp_ckpt=args.navdp_ckpt,
+            env=env,
+        )
+
+        obs_provider = real_env
+        scheduler = Scheduler(vlm, store_map, vla, nav, turn,
+                              use_vlm_judge=not args.no_vlm_judge)
+
+        # Override VLM planner to use StoreMapProvider's dynamic map
+        # (top-down image + inventory text, updated with robot position)
+        _orig_plan = vlm.plan
+        def plan_with_map(command, map_block, image=None):
+            map_info = real_env.get_map_info()
+            return _orig_plan(command, map_info.full_prompt_block, map_info.topdown_image)
+        vlm.plan = plan_with_map
+
     else:
-        raise NotImplementedError("real mode: wire obs_provider to your ROS2 bridge")
+        raise ValueError(f"Unknown mode: {args.mode}")
 
     result = scheduler.run(args.command, obs_provider)
 

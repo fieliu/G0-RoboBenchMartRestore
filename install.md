@@ -212,5 +212,33 @@ bash scripts/run/finetune_lora_fetch.sh 2 \
   logger.type=swanlab logger.mode=disabled \
   checkpointing_steps=500
 
+# 检查是否使用了 CUDA 视频解码
+cd ~/VLA/G0-RoboBenchMartRestore
+grep -rnE "VideoDecoder|device=|torchcodec|decode" src/galaxea_fm/data/ .venv/lib/python3.10/site-packages/lerobot/ 2>/dev/null | grep -iE "device|VideoDecoder|cuda|cpu" | head
+
+
+(robort_mart) root@lh:/home/lh/VLA/GalaxeaVLA-main# $P scripts/test_vlm_planning.py \
+  --scene-dir /home/lh/VLA/RoboBenchMart-main/demo_envs/pick_to_basket \
+  --env-name PickToBasketContNiveaEnv --out-dir vlm_plan_test \
+  --command "把 Fanta 放进篮子" --target-product Fanta \
+  --call-vlm --vlm-provider anthropic \
+  --vlm-api-key "sk-eZj3ivmJ40XCbNrYJdDgb9mtRwcmlJdN6YFoiBS97hTpOlD0" \
+  --vlm-base-url "https://www.packyapi.com" \
+  --vlm-model "claude-opus-4-8"
+
+
+  cd /home/lh/VLA/GalaxeaVLA-main
+  P=/home/lh/software/miniconda3/envs/robort_mart/bin/python
+  export ANTHROPIC_BASE_URL=http://127.0.0.1:15721
+  export ANTHROPIC_AUTH_TOKEN=sk-eZj3ivmJ40XCbNrYJdDgb9mtRwcmlJdN6YFoiBS97hTpOlD0
+  export ANTHROPIC_MODEL=claude-opus-4-8
+  $P scripts/nav_sim_integration.py \
+    --scene-dir generated_envs/restock_scene \
+    --env-name RestockFlowContDuffEnv \
+    --command "把仓库里的Duff补货到商业区货架" \
+    --planner grid \
+    --device cuda:0
+
+
 
 
