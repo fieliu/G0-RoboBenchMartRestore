@@ -232,6 +232,9 @@ grep -rnE "VideoDecoder|device=|torchcodec|decode" src/galaxea_fm/data/ .venv/li
   export ANTHROPIC_BASE_URL=http://127.0.0.1:15721
   export ANTHROPIC_AUTH_TOKEN=sk-eZj3ivmJ40XCbNrYJdDgb9mtRwcmlJdN6YFoiBS97hTpOlD0
   export ANTHROPIC_MODEL=claude-opus-4-8
+
+ 
+
   $P scripts/nav_sim_integration.py \
     --scene-dir generated_envs/restock_scene \
     --env-name RestockFlowContDuffEnv \
@@ -240,5 +243,24 @@ grep -rnE "VideoDecoder|device=|torchcodec|decode" src/galaxea_fm/data/ .venv/li
     --device cuda:0
 
 
+# 评估模型
+source .venv/bin/activate
 
+CKPT=/public/home/nwpu_liyl/VLA/outputs/robobenchmart/fetch_lora_finetune/2026-06-06_01-31-55/checkpoints/step_106116/model.pt
+# 拿商品放篮子
+python scripts/eval_robobenchmart.py \
+    --scene-dir $RBM_ROOT/demo_envs/pick_to_basket \
+    --env-name PickToBasketContNiveaEnv \
+    --ckpt-path $CKPT -n 10 --save-video
 
+# 从地面捡商品
+python scripts/eval_robobenchmart.py \
+    --scene-dir $RBM_ROOT/demo_envs/pick_from_floor \
+    --env-name PickFromFloorContNiveaEnv \
+    --ckpt-path $CKPT -n 10 --save-video
+
+# 从篮子放回货架
+python scripts/eval_robobenchmart.py \
+    --scene-dir $RBM_ROOT/demo_envs/pick_to_basket \
+    --env-name RestockBasketToShelfContNiveaEnv \
+    --ckpt-path $CKPT -n 10 --save-video

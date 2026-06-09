@@ -39,16 +39,24 @@ RBM_ROOT = os.environ.get("RBM_ROOT", "/home/lh/VLA/RoboBenchMart-main")
 # ------------------------------------------------------------------
 
 def load_policy(ckpt_path: str,
-                cfg_path: str = "configs/task/robobenchmart/fetch_lora_finetune.yaml",
+                task_cfg: str = "robobenchmart/fetch_lora_finetune",
                 device: str = "cuda"):
-    """Load LoRA-finetuned G0Plus policy + processor."""
+    """Load LoRA-finetuned G0Plus policy + processor.
+
+    Uses Hydra compose to properly merge defaults (data, model) before
+    resolving interpolations like ${data.processor.action_output_dim}.
+    """
     from omegaconf import OmegaConf
+    from hydra import initialize, compose
     from hydra.utils import instantiate
     from galaxea_fm.utils.config_resolvers import register_default_resolvers
     from galaxea_fm.utils.load_pretrained_resumed import load_checkpoint_for_eval
 
     register_default_resolvers()
-    cfg = OmegaConf.load(cfg_path)
+
+    with initialize(version_base="1.3", config_path="../configs"):
+        cfg = compose(config_name="train.yaml",
+                      overrides=[f"task={task_cfg}"])
     OmegaConf.resolve(cfg)
 
     policy = instantiate(cfg.model.model_arch)
@@ -304,9 +312,9 @@ def parse_args():
                         help="Gym env id. Auto-detected from scene metadata if omitted.")
     parser.add_argument("--ckpt-path", type=str, required=True,
                         help="Path to LoRA checkpoint (e.g. best_model.pt)")
-    parser.add_argument("--cfg-path", type=str,
-                        default="configs/task/robobenchmart/fetch_lora_finetune.yaml",
-                        help="Training config used for the checkpoint")
+    parser.add_argument("--task-cfg", type=str,
+                        default="robobenchmart/fetch_lora_finetune",
+                        help="Hydra task config name (e.g. robobenchmart/fetch_lora_finetune)")
     parser.add_argument("--coarse-task", type=str, default="",
                         help="High-level task description for coarse_task channel. "
                              "If empty, uses the env's language_instruction.")
@@ -334,7 +342,7 @@ def main():
     args = parse_args()
 
     # Load policy
-    policy, processor, cfg = load_policy(args.ckpt_path, args.cfg_path, args.device)
+    policy, processor, cfg = load_policy(args.ckpt_path, args.task_cfg, args.device)
 
     # Create environment
     env = make_env(args.scene_dir, args.env_name, args.sim_backend, args.shader)
