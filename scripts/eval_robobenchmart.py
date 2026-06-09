@@ -6,12 +6,16 @@ runs N episodes, and reports per-scene + aggregate success rates.
 
 Usage:
     python scripts/eval_robobenchmart.py \
-        --scene-dir /path/to/RoboBenchMart-main/demo_envs/pick_to_basket \
-        --env-name PickToBasketContNiveaEnv \
-        --ckpt-path ./ckpts/fetch_lora_best/best_model.pt \
-        -n 10 --save-video
+        task=robobenchmart/fetch_lora_finetune \
+        +ckpt_path=./ckpts/fetch_lora_best/model.pt \
+        +eval_scene_dir=$RBM_ROOT/demo_envs/pick_to_basket \
+        +eval_env_name=PickToBasketContNiveaEnv \
+        +eval_num_traj=10 +eval_save_video=true
 
-If --env-name is omitted, it is auto-detected from the scene's json metadata.
+Specify GPU:
+    EVAL_GPU=0 python scripts/eval_robobenchmart.py ...
+    # or
+    CUDA_VISIBLE_DEVICES=1 python scripts/eval_robobenchmart.py ...
 """
 
 import json
@@ -19,7 +23,6 @@ import logging
 import multiprocessing as mp
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -32,6 +35,14 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger("EvalRoboBenchMart")
 
 RBM_ROOT = os.environ.get("RBM_ROOT", "/home/lh/VLA/RoboBenchMart-main")
+
+# Fetch pd_joint_pos action layout (13-DoF):
+#   [0-6]   arm: shoulder_pan, shoulder_lift, upperarm_roll,
+#           elbow_flex, forearm_roll, wrist_flex, wrist_roll
+#   [7]     gripper: mimic (1 value controls both fingers)
+#   [8-10]  body: head_pan, head_tilt, torso_lift
+#   [11-12] base: forward_vel, rotation_vel
+FETCH_ACTION_DIM = 13
 
 
 # ------------------------------------------------------------------
@@ -47,9 +58,17 @@ def load_policy(ckpt_path: str, cfg: DictConfig, device: str = "cuda"):
     policy, stats = load_checkpoint_for_eval(ckpt_path, policy, device="cpu")
     policy = policy.to(device).eval()
 
+    # Move action tokenizer to same device if present
+    if hasattr(policy, 'action_tokenizer'):
+        policy.action_tokenizer.to(device)
+
     processor = instantiate(cfg.data.processor)
     processor.set_normalizer_from_stats(stats)
     processor.eval()
+
+    # Set tokenizer for autoregressive models
+    if hasattr(policy, 'set_tokenizer') and hasattr(processor, 'tokenizer'):
+        policy.set_tokenizer(processor.tokenizer)
 
     logger.info(f"Loaded policy from {ckpt_path}")
     return policy, processor
@@ -59,30 +78,55 @@ def load_policy(ckpt_path: str, cfg: DictConfig, device: str = "cuda"):
 # 2. Observation construction
 # ------------------------------------------------------------------
 
-def get_sensor_names(env):
-    """Auto-detect sensor camera names from ManiSkill scene."""
+def get_sensor_names(obs):
+    """Auto-detect sensor camera names from ManiSkill observation.
+
+    ManiSkill returns obs['sensor_data'] as a dict of camera names.
+    For Fetch: left_base_camera_link (head), right_base_camera_link, fetch_hand (wrist).
+    """
     try:
-        sensor_data = env.scene.get_sensor_data()
-        all_keys = list(sensor_data.keys()) if isinstance(sensor_data, dict) else []
+        all_keys = list(obs.get("sensor_data", {}).keys())
     except Exception:
         all_keys = []
 
     names = {"head_camera": None, "left_wrist_camera": None, "right_wrist_camera": None}
     for k in all_keys:
         kl = k.lower()
-        if "head" in kl or "agent" in kl or "top" in kl or "ceiling" in kl:
+        if "left_base" in kl or "head" in kl or "agent" in kl or "top" in kl:
             names["head_camera"] = k
-        elif "left" in kl or "wrist" in kl or "hand" in kl:
+        elif "fetch_hand" in kl or "wrist" in kl or "hand" in kl:
             names["left_wrist_camera"] = k
             names["right_wrist_camera"] = k  # Fetch has one gripper
+        elif "right_base" in kl:
+            names["right_wrist_camera"] = k
+
+    # Fallback: try known Fetch camera names
+    if names["head_camera"] is None and "left_base_camera_link" in all_keys:
+        names["head_camera"] = "left_base_camera_link"
+    if names["left_wrist_camera"] is None and "fetch_hand" in all_keys:
+        names["left_wrist_camera"] = "fetch_hand"
+    if names["right_wrist_camera"] is None and "right_base_camera_link" in all_keys:
+        names["right_wrist_camera"] = "right_base_camera_link"
+    elif names["right_wrist_camera"] is None:
+        names["right_wrist_camera"] = names["left_wrist_camera"]
+
     return names
 
 
-def build_vla_obs(env, sensor_names: dict) -> Dict:
-    """Build observation dict for VLA policy from ManiSkill env."""
+def build_vla_obs(obs, sensor_names: dict, image_size: int = 224) -> Dict:
+    """Build observation dict for VLA policy from ManiSkill obs.
+
+    Args:
+        obs: observation dict from env.step()/env.reset(), with 'sensor_data' and 'agent' keys.
+        sensor_names: mapping from VLA camera role to ManiSkill sensor key.
+        image_size: resize images to (image_size, image_size).
+
+    Returns images as float32 [0,1] tensors in (C, H, W) format,
+    matching what the processor expects after ToTensor.
+    """
     import cv2
 
-    sensor_data = env.scene.get_sensor_data()
+    sensor_data = obs.get("sensor_data", {})
 
     head_rgb_raw = None
     left_wrist_rgb_raw = None
@@ -105,13 +149,27 @@ def build_vla_obs(env, sensor_names: dict) -> Dict:
         head_rgb_raw = np.zeros((360, 640, 3), dtype=np.uint8)
     if left_wrist_rgb_raw is None:
         left_wrist_rgb_raw = np.zeros((128, 128, 3), dtype=np.uint8)
-    right_wrist_rgb_raw = left_wrist_rgb_raw.copy()
 
-    qpos = env.agent.get_qpos()[0].cpu().numpy()
+    # Right wrist: try dedicated camera, else duplicate left
+    right_wrist_rgb_raw = None
+    right_key = sensor_names.get("right_wrist_camera")
+    if right_key and right_key in sensor_data and right_key != left_key:
+        try:
+            right_wrist_rgb_raw = sensor_data[right_key]["rgb"][0].cpu().numpy()
+        except Exception:
+            pass
+    if right_wrist_rgb_raw is None:
+        right_wrist_rgb_raw = left_wrist_rgb_raw.copy()
 
-    head_rgb = cv2.resize(head_rgb_raw, (224, 224)).transpose(2, 0, 1).astype(np.float32) / 255.0
-    left_wrist = cv2.resize(left_wrist_rgb_raw, (224, 224)).transpose(2, 0, 1).astype(np.float32) / 255.0
-    right_wrist = left_wrist.copy()
+    qpos = obs["agent"]["qpos"][0].cpu().numpy()
+
+    # Resize and convert to (C, H, W) float32 [0, 1]
+    head_rgb = cv2.resize(head_rgb_raw, (image_size, image_size))
+    head_rgb = head_rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
+    left_wrist = cv2.resize(left_wrist_rgb_raw, (image_size, image_size))
+    left_wrist = left_wrist.transpose(2, 0, 1).astype(np.float32) / 255.0
+    right_wrist = cv2.resize(right_wrist_rgb_raw, (image_size, image_size))
+    right_wrist = right_wrist.transpose(2, 0, 1).astype(np.float32) / 255.0
 
     return {
         "head_rgb": head_rgb,
@@ -129,8 +187,13 @@ def build_vla_obs(env, sensor_names: dict) -> Dict:
 # ------------------------------------------------------------------
 
 def predict_action(policy, processor, obs: Dict, task: str,
-                   coarse_task: str, device: str = "cuda") -> np.ndarray:
-    """Predict 15-DoF action from observation."""
+                   coarse_task: str, action_dim: int,
+                   device: str = "cuda") -> np.ndarray:
+    """Predict action chunk from observation.
+
+    Returns:
+        np.ndarray of shape (chunk_size, action_dim)
+    """
     from galaxea_fm.utils.pytorch_utils import dict_apply
 
     sample = {
@@ -157,7 +220,23 @@ def predict_action(policy, processor, obs: Dict, task: str,
     action = batch["action"]
     if isinstance(action, dict):
         action = action["default"]
-    return np.asarray(action).reshape(-1, 15)
+    # action shape: (B, chunk_size, action_dim)
+    return np.asarray(action).reshape(-1, action_dim)
+
+
+def vla_action_to_env_action(vla_action: np.ndarray) -> np.ndarray:
+    """Convert VLA action to env-compatible action.
+
+    VLA outputs 13-DoF (pd_joint_pos). The env expects the same 13-DoF.
+    We zero out head joints (indices 8, 9) to prevent head drift,
+    matching eval_policy_client.py behavior.
+    """
+    action = vla_action.astype(np.float32)
+    # Zero out head_pan and head_tilt to prevent head drift during manipulation
+    if len(action) > 9:
+        action[8] = 0  # head_pan
+        action[9] = 0  # head_tilt
+    return action
 
 
 # ------------------------------------------------------------------
@@ -178,7 +257,8 @@ def save_video(frames: List[np.ndarray], path: str, fps: int = 30):
 # ------------------------------------------------------------------
 
 def make_env(scene_dir: str, env_name: Optional[str] = None,
-             sim_backend: str = "auto", shader: str = "default"):
+             sim_backend: str = "auto", shader: str = "default",
+             robot_uids: str = "ds_fetch_basket"):
     """Create RoboBenchMart gym environment."""
     sys.path.append(RBM_ROOT)
     import gymnasium as gym
@@ -198,6 +278,7 @@ def make_env(scene_dir: str, env_name: Optional[str] = None,
 
     env = gym.make(
         env_name,
+        robot_uids=robot_uids,
         config_dir_path=scene_dir,
         num_envs=1,
         control_mode="pd_joint_pos",
@@ -216,56 +297,81 @@ def make_env(scene_dir: str, env_name: Optional[str] = None,
 # 6. Single episode runner
 # ------------------------------------------------------------------
 
-def run_episode(env, policy, processor, sensor_names: dict,
-                coarse_task: str, max_horizon: int,
+def run_episode(env, policy, processor,
+                coarse_task: str, action_dim: int, max_horizon: int,
                 replan_steps: int = 5, save_video_flag: bool = False,
                 seed: int = 0) -> Dict:
     """Run one closed-loop episode. Returns dict with success, steps, frames."""
-    obs_ms, info = env.reset(seed=seed, options={"reconfigure": True})
-    language_instruction = env.language_instructions[0]
+    obs, info = env.reset(seed=seed, options={"reconfigure": True})
 
-    sensor_names = sensor_names or get_sensor_names(env)
+    # Get language instruction
+    try:
+        language_instruction = env.language_instructions[0]
+    except (AttributeError, IndexError):
+        language_instruction = "pick the item"
+
+    # Auto-detect sensor names from first observation
+    sensor_names = get_sensor_names(obs)
+    logger.info(f"Detected sensors: {sensor_names}")
 
     frames_head = [] if save_video_flag else None
     frames_third = [] if save_video_flag else None
 
     step = 0
-    success = False
+    done = False
+    truncated = False
 
-    while step < max_horizon:
-        vla_obs = build_vla_obs(env, sensor_names)
+    def _to_bool(val):
+        """Convert ManiSkill done/truncated (possibly array/tensor) to bool."""
+        if isinstance(val, (bool, int, float)):
+            return bool(val)
+        if isinstance(val, torch.Tensor):
+            return bool(val.flatten()[0].item())
+        if isinstance(val, np.ndarray):
+            return bool(val.flatten()[0])
+        return bool(val)
+
+    while step < max_horizon and not _to_bool(done) and not _to_bool(truncated):
+        vla_obs = build_vla_obs(obs, sensor_names)
 
         if save_video_flag:
             frames_head.append(vla_obs["head_rgb_raw"].copy())
             try:
                 rendered = env.render()
                 if rendered is not None:
+                    # ManiSkill render may return (1, H, W, 3) or (H, W, 3)
+                    if isinstance(rendered, np.ndarray):
+                        if rendered.ndim == 4:
+                            rendered = rendered[0]
                     frames_third.append(rendered)
             except Exception:
                 pass
 
+        # Predict action chunk: (chunk_size, action_dim)
         action_chunk = predict_action(
             policy, processor, vla_obs,
             task=language_instruction,
             coarse_task=coarse_task,
+            action_dim=action_dim,
         )
 
+        # Execute replan_steps actions from the chunk
         for i in range(min(replan_steps, action_chunk.shape[0])):
-            action = action_chunk[i].astype(np.float32)
-            action[8] = 0
-            action[9] = 0
-            obs_ms, reward, done, truncated, info = env.step(action)
+            env_action = vla_action_to_env_action(action_chunk[i])
+            obs, reward, done, truncated, info = env.step(env_action)
             step += 1
 
-            if done or truncated:
+            if _to_bool(done) or _to_bool(truncated):
                 break
 
-        if done or truncated:
-            break
-
-    success = bool(info.get("success", [False])[0]
-                   if isinstance(info.get("success"), (list, np.ndarray))
-                   else info.get("success", False))
+    # Extract success from info
+    raw_success = info.get("success", False)
+    if isinstance(raw_success, torch.Tensor):
+        success = bool(raw_success.flatten()[0].item())
+    elif isinstance(raw_success, (list, np.ndarray)):
+        success = bool(np.asarray(raw_success).flatten()[0])
+    else:
+        success = bool(raw_success)
 
     return {
         "success": success,
@@ -283,17 +389,25 @@ def run_episode(env, policy, processor, sensor_names: dict,
 @torch.no_grad()
 def eval_main(cfg: DictConfig) -> None:
     """Core evaluation logic, receives a fully-resolved Hydra config."""
+    from accelerate import Accelerator
     from galaxea_fm.utils.config_resolvers import register_default_resolvers
+
+    # Register custom resolvers (split, sum_shapes, etc.) before resolve
     register_default_resolvers()
     OmegaConf.resolve(cfg)
 
-    # Extract eval-specific params from cfg.ckpt_path convention
-    # or from env vars / hydra overrides
-    ckpt_path = cfg.get("ckpt_path")
-    scene_dir = cfg.get("eval_scene_dir",
-                        os.environ.get("EVAL_SCENE_DIR", ""))
-    env_name = cfg.get("eval_env_name",
-                       os.environ.get("EVAL_ENV_NAME", None))
+    # Initialize Accelerator (required by GalaxeaZeroPolicy.__init__)
+    gpu_id = int(os.environ.get("LOCAL_RANK", os.environ.get("EVAL_GPU", "0")))
+    torch.cuda.set_device(gpu_id)
+    accelerator = Accelerator(mixed_precision="bf16")
+    _ = accelerator  # keep alive for instantiate
+
+    # Extract eval-specific params
+    ckpt_path = cfg.get("ckpt_path", None)
+    scene_dir = (cfg.get("eval_scene_dir", None)
+                 or os.environ.get("EVAL_SCENE_DIR", ""))
+    env_name = (cfg.get("eval_env_name", None)
+                or os.environ.get("EVAL_ENV_NAME", None))
     coarse_task = cfg.get("eval_coarse_task", "")
     num_traj = cfg.get("eval_num_traj", 10)
     max_horizon = cfg.get("eval_max_horizon", 300)
@@ -303,9 +417,17 @@ def eval_main(cfg: DictConfig) -> None:
     shader = cfg.get("eval_shader", "default")
     save_video_flag = cfg.get("eval_save_video", False)
     video_dir = cfg.get("eval_video_dir", None)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = f"cuda:{gpu_id}"
 
-    assert ckpt_path, "Must set ckpt_path (via +ckpt_path=... or env)"
+    # Determine action_dim from config (should be 13 for Fetch pd_joint_pos)
+    try:
+        action_dim = OmegaConf.select(cfg, "data.processor.action_output_dim",
+                                      default=FETCH_ACTION_DIM)
+    except Exception:
+        action_dim = FETCH_ACTION_DIM
+    logger.info(f"Action dim from config: {action_dim}")
+
+    assert ckpt_path, "Must set ckpt_path (via +ckpt_path=...)"
     assert scene_dir, "Must set eval_scene_dir (via +eval_scene_dir=... or EVAL_SCENE_DIR env)"
 
     # Load policy
@@ -313,8 +435,14 @@ def eval_main(cfg: DictConfig) -> None:
 
     # Create environment
     env = make_env(scene_dir, env_name, sim_backend, shader)
-    sensor_names = get_sensor_names(env)
-    logger.info(f"Sensor names: {sensor_names}")
+
+    # Verify action space matches
+    env_action_dim = env.action_space.shape[0]
+    if action_dim != env_action_dim:
+        logger.warning(
+            f"Config action_dim={action_dim} != env action_space={env_action_dim}. "
+            f"Using env action_space dimension.")
+        action_dim = env_action_dim
 
     # Video output dir
     if not video_dir:
@@ -332,8 +460,9 @@ def eval_main(cfg: DictConfig) -> None:
         seed = start_seed + traj_idx
 
         ep = run_episode(
-            env, policy, processor, sensor_names,
+            env, policy, processor,
             coarse_task=coarse_task,
+            action_dim=action_dim,
             max_horizon=max_horizon,
             replan_steps=replan_steps,
             save_video_flag=save_video_flag,
@@ -371,6 +500,7 @@ def eval_main(cfg: DictConfig) -> None:
     print("\n" + "=" * 60)
     print(f"  Scene: {scene_dir}")
     print(f"  Checkpoint: {ckpt_path}")
+    print(f"  Action dim: {action_dim}")
     print(f"  Episodes: {total}")
     print(f"  Successes: {successes}")
     print(f"  Success Rate: {successes / total * 100:.1f}%")
@@ -385,6 +515,7 @@ def eval_main(cfg: DictConfig) -> None:
         json.dump({
             "scene_dir": scene_dir,
             "ckpt_path": ckpt_path,
+            "action_dim": action_dim,
             "num_traj": total,
             "successes": successes,
             "success_rate": successes / total * 100,
@@ -402,7 +533,7 @@ import hydra
 
 
 @hydra.main(version_base="1.3", config_path="../configs", config_name="train.yaml")
-def main(cfg: DictConfig) -> Optional[float]:
+def main(cfg: DictConfig) -> None:
     eval_main(cfg)
 
 
