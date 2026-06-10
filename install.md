@@ -55,7 +55,7 @@ cd /home/lh/VLA/GalaxeaVLA-main
 uv sync --index-strategy unsafe-best-match
 source .venv/bin/activate
 uv pip install -e .
-uv pip install -e .[dev]
+uv pip install -e ".[dev]"
 ```
 **✅ 验证**（最关键一步）：
 ```bash
@@ -98,6 +98,8 @@ mkdir -p $HF_DATASETS_CACHE $GALAXEA_FM_OUTPUT_DIR $GALAXEA_FM_DATASET_STATS_CAC
 echo $GALAXEA_FM_OUTPUT_DIR    # ✅ 验证: 非空且目录存在
 ```
 
+### 步骤 6.1：安装 mani_skill
+uv pip install mani_skill
 > 建议写进 `~/.bashrc`，避免每次重开终端丢失。
 
 ### 步骤 6.5：配置 VLM 规划器（仅部署需要，训练不需要）
@@ -154,57 +156,6 @@ echo "=== GPU ===" && nvidia-smi --query-gpu=name,memory.total --format=csv,nohe
 ```
 全部无报错、`cuda: True`、版本号对得上 = 配置成功。
 
-## 四、常见坑
-
-```
-1. torch.cuda.is_available()=False
-   → WSL 里需在 Windows 装 NVIDIA driver (含 WSL 支持), Linux 侧不要再装驱动
-   → 检查: nvidia-smi 在 WSL 里能否输出
-
-2. Python 版本不对
-   → 必须 3.10。uv sync 会自动拉 3.10, 别用系统 python
-
-3. numpy 2.x 冲突
-   → 项目锁 1.26.4。被带成 2.x 会 ABI 报错 → uv pip install numpy==1.26.4
-
-4. 显存不足 (微调)
-   → 全量要 70G。LoRA + A100 40G 若仍 OOM: 降 batch_size 4→2 + grad_accum 2→4
-
-5. HF 下载慢/失败
-   → export HF_ENDPOINT=https://hf-mirror.com (步骤6已含)
-```
-bash scripts/run/finetune.sh 2 robobenchmart/fetch_lora_finetune \
-  model.batch_size=2 model.grad_accumulation_steps=4 \
-  model.model_arch.pretrained_model_path=./ckpts/paligemma-3b-pt-224 \
-  logger.type=swanlab logger.mode=disabled \
-  checkpointing_steps=500
-
-  uv pip install nvidia-npp-cu12
-  conda install -c conda-forge "ffmpeg=6"
-
-cd ~/VLA/G0-RoboBenchMartRestore && source .venv/bin/activate
-export GALAXEA_FM_OUTPUT_DIR=/public/home/nwpu_liyl/VLA/outputs
-export LD_LIBRARY_PATH=$(pwd)/.venv/lib/python3.10/site-packages/nvidia/npp/lib:$LD_LIBRARY_PATH
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
-bash scripts/run/finetune.sh 2 robobenchmart/fetch_lora_finetune \
-  model.batch_size=2 model.grad_accumulation_steps=4 \
-  model.model_arch.vla_training_strategy=action-expert-only \
-  model.model_arch.pretrained_model_path=./ckpts/paligemma-3b-pt-224 \
-  model.pretrained_ckpt=./ckpts/G0Plus_3B_base/model_state_dict.pt \
-  load_legacy_checkpoint=true \
-  logger.type=swanlab logger.mode=disabled \
-  checkpointing_steps=500
-
-
-cd ~/VLA/G0-RoboBenchMartRestore && source .venv/bin/activate
-
-# —— 4个环境变量, 一个都不能少 ——
-export GALAXEA_FM_OUTPUT_DIR=/public/home/nwpu_liyl/VLA/outputs
-export GALAXEA_FM_DATASET_STATS_CACHE_DIR=/public/home/nwpu_liyl/VLA/stats   # ← 这次补上
-export LD_LIBRARY_PATH=$(pwd)/.venv/lib/python3.10/site-packages/nvidia/npp/lib:$LD_LIBRARY_PATH
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-
 bash scripts/run/finetune_lora_fetch.sh 2 \
   model.batch_size=2 model.grad_accumulation_steps=4 \
   model.model_arch.pretrained_model_path=./ckpts/paligemma-3b-pt-224 \
@@ -227,6 +178,27 @@ grep -rnE "VideoDecoder|device=|torchcodec|decode" src/galaxea_fm/data/ .venv/li
   --vlm-model "claude-opus-4-8"
 
 
+python scripts/nav_sim_integration.py \
+    --scene-dir /root/autodl-tmp/RoboBenchMartRestore/demo_envs/pick_to_basket \
+    --env-name RestockBasketToShelfContDuffEnv \
+    --command "把仓库里的Duff补货到商业区货架" \
+    --planner grid \
+    --device cuda:0 \
+    --vlm-provider anthropic \
+    --vlm-api-key "sk-eZj3ivmJ40XCbNrYJdDgb9mtRwcmlJdN6YFoiBS97hTpOlD0" \
+    --vlm-base-url "https://www.packyapi.com" \
+    --vlm-model "claude-opus-4-8"
+
+export ANTHROPIC_AUTH_TOKEN="sk-eZj3ivmJ40XCbNrYJdDgb9mtRwcmlJdN6YFoiBS97hTpOlD0"
+export ANTHROPIC_BASE_URL="https://www.packyapi.com"
+export ANTHROPIC_MODEL="claude-opus-4-8"
+python scripts/nav_sim_integration.py \
+    --scene-dir /root/autodl-tmp/RoboBenchMartRestore/demo_envs/pick_to_basket \
+    --env-name RestockBasketToShelfContDuffEnv \
+    --command "把仓库里的Duff补货到商业区货架" \
+    --planner grid \
+    --device cuda:0
+
   cd /home/lh/VLA/GalaxeaVLA-main
   P=/home/lh/software/miniconda3/envs/robort_mart/bin/python
   export ANTHROPIC_BASE_URL=http://127.0.0.1:15721
@@ -246,22 +218,108 @@ grep -rnE "VideoDecoder|device=|torchcodec|decode" src/galaxea_fm/data/ .venv/li
 # 评估模型
 source .venv/bin/activate
 
-CKPT=/public/home/nwpu_liyl/VLA/outputs/robobenchmart/fetch_lora_finetune/2026-06-06_01-31-55/checkpoints/step_106116/model.pt
-export GALAXEA_FM_OUTPUT_DIR=./outputs
-# 拿商品放篮子
-python scripts/eval_robobenchmart.py \
-    --scene-dir $RBM_ROOT/demo_envs/pick_to_basket \
-    --env-name PickToBasketContNiveaEnv \
-    --ckpt-path $CKPT -n 10 --save-video
+export ANTHROPIC_AUTH_TOKEN="sk-eZj3ivmJ40XCbNrYJdDgb9mtRwcmlJdN6YFoiBS97hTpOlD0"
+export ANTHROPIC_BASE_URL="https://www.packyapi.com"
+export ANTHROPIC_MODEL="claude-opus-4-8"
 
-# 从地面捡商品
-python scripts/eval_robobenchmart.py \
-    --scene-dir $RBM_ROOT/demo_envs/pick_from_floor \
-    --env-name PickFromFloorContNiveaEnv \
-    --ckpt-path $CKPT -n 10 --save-video
+source .venv/bin/activate
+export RBM_ROOT=/root/autodl-tmp/RoboBenchMartRestore
+export GALAXEA_FM_OUTPUT_DIR=/root/autodl-tmp/G0-RoboBenchMartRestore/outputs
+export GALAXEA_FM_DATASET_STATS_CACHE_DIR=/root/autodl-tmp/G0-RoboBenchMartRestore/stats
+export GALAXEA_FM_DATA_DIR=/root/autodl-tmp/G0-RoboBenchMartRestore   # 数据集根目录
+mkdir -p $GALAXEA_FM_OUTPUT_DIR $GALAXEA_FM_DATASET_STATS_CACHE_DIR
 
-# 从篮子放回货架
+CKPT=/root/autodl-tmp/G0-RoboBenchMartRestore/pretain/model.pt
+# 任务①  拿商品放篮子
 python scripts/eval_robobenchmart.py \
-    --scene-dir $RBM_ROOT/demo_envs/pick_to_basket \
-    --env-name RestockBasketToShelfContNiveaEnv \
-    --ckpt-path $CKPT -n 10 --save-video
+    task=robobenchmart/fetch_lora_finetune \
+    +ckpt_path=$CKPT \
+    +eval_scene_dir=$RBM_ROOT/demo_envs/pick_to_basket \
+    +eval_env_name=PickToBasketContNiveaEnv \
+    +eval_num_traj=10 +eval_save_video=true
+
+# 任务②  从地面捡商品
+python scripts/eval_robobenchmart.py \
+    task=robobenchmart/fetch_lora_finetune \
+    +ckpt_path=$CKPT \
+    +eval_scene_dir=$RBM_ROOT/demo_envs/pick_from_floor \
+    +eval_env_name=PickFromFloorContNiveaEnv \
+    +eval_num_traj=10 +eval_save_video=true
+
+# 任务③  从篮子放回货架
+python scripts/eval_robobenchmart.py \
+    task=robobenchmart/fetch_lora_finetune \
+    +ckpt_path=$CKPT \
+    +eval_scene_dir=$RBM_ROOT/demo_envs/pick_to_basket \
+    +eval_env_name=RestockBasketToShelfContNiveaEnv \
+    +eval_num_traj=10 +eval_save_video=true
+
+## 五、RoboBenchMart 仿真依赖（跑 nav_sim_integration / eval / 场景生成 需要）
+
+> `scripts/nav_sim_integration.py` 等会 `import dsynth.envs`，依赖 RoboBenchMart 仓库 (`dsynth` 包)
+> 及其底层仿真库 ManiSkill3。下面这些**装进当前项目的 `.venv`**（不是单独环境）。
+
+### 5.1 安装缺失依赖（按报错顺序逐个补，已整理成一条）
+
+```bash
+cd ~/VLA/G0-RoboBenchMartRestore && source .venv/bin/activate
+
+# RoboBenchMart 的全部依赖（来自 RoboBenchMartRestore/requirements.txt）
+# 用阿里云镜像加速；unsafe-best-match 避免多源版本解析失败
+uv pip install --index-strategy unsafe-best-match \
+    -i https://mirrors.aliyun.com/pypi/simple/ \
+    mani_skill "scene-synthesizer[recommend]" usd-core "pyglet<2" \
+    hydra-core trimesh==4.5.3 typeguard==4.4.2 pandas websockets msgpack "huggingface_hub[cli]"
+
+# VLM 规划器 SDK（按用的 provider 装；anthropic=claude, dashscope=qwen, openai=gpt/gemini）
+uv pip install -i https://mirrors.aliyun.com/pypi/simple/ anthropic dashscope openai
+```
+
+**遇到过的报错链（都是依赖没装齐）：**
+```
+ModuleNotFoundError: No module named 'mani_skill'         → 装 mani_skill
+ModuleNotFoundError: No module named 'scene_synthesizer'  → 装 scene-synthesizer[recommend]
+ModuleNotFoundError: No module named 'anthropic'          → 装 anthropic（用 claude/anthropic provider 时）
+```
+> 注：装 scene-synthesizer 会把 mujoco 升到 3.9.0（dm-control 依赖），一般无影响。
+
+### 5.2 验证依赖链路通
+
+```bash
+# dsynth 在另一个仓库，需要把它的路径加进 PYTHONPATH
+PYTHONPATH=/root/autodl-tmp/RoboBenchMartRestore \
+    python -c "import dsynth.envs; print('dsynth.envs import OK')"
+# ✅ 验证：输出 dsynth.envs import OK（环境注册成功）
+```
+
+### 5.3 运行仿真集成脚本
+
+```bash
+# 若报 No module named 'dsynth'，在命令前加 PYTHONPATH 指向 RoboBenchMart 仓库根目录
+export PYTHONPATH=/root/autodl-tmp/RoboBenchMartRestore:$PYTHONPATH
+
+python scripts/nav_sim_integration.py \
+    --scene-dir generated_envs/restock_scene \
+    --env-name RestockFlowContDuffEnv \
+    --command "把仓库里的Duff补货到商业区货架" \
+    --planner grid \
+    --device cuda:0
+```
+
+> ⚠️ ManiSkill 仿真渲染需要 **Vulkan API**。若报 Vulkan/渲染相关错误，参考
+> [ManiSkill 安装故障排查](https://maniskill.readthedocs.io/en/latest/user_guide/getting_started/installation.html#troubleshooting)。
+
+### 5.4 终端中文乱码（粘贴中文指令显示乱码时）
+
+现象：`locale: Cannot set LC_CTYPE ...`，且 `locale -a` 里没有 `en_US.UTF-8`，只有 `C.utf8`。
+
+```bash
+# 方案 A（最快，系统已有 C.utf8）：
+export LC_ALL=C.utf8
+export LANG=C.utf8
+# 写进 ~/.zshrc 永久生效
+
+# 方案 B（生成 en_US.UTF-8，治本）：
+apt-get update && apt-get install -y locales
+locale-gen en_US.UTF-8 && update-locale LANG=en_US.UTF-8
+```

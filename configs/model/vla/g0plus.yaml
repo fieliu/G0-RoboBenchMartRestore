@@ -43,8 +43,8 @@ use_sync_bn: False
 tokenizer:
   _target_: galaxea_fm.models.galaxea_zero.paligemma.tokenizer.PaliGemmaTokenizer
   tokenizer_params:
-    pretrained_model_name_or_path: google/paligemma-3b-pt-224
-    local_files_only: False
+    pretrained_model_name_or_path: /root/autodl-tmp/G0-RoboBenchMartRestore/ckpts/paligemma-3b-pt-224
+    local_files_only: True
     token: null
   pad_token_id: ${model.model_arch.pad_token_id}
   image_token_index: ${model.model_arch.image_token_index}

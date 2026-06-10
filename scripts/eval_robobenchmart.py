@@ -98,11 +98,11 @@ def load_policy(ckpt_path: str, cfg: DictConfig, device: str = "cuda"):
     ckpt = Path(ckpt_path)
     if ckpt.is_dir():
         # New format: directory with model.pt + dataset_stats.json
-        state_dict = torch.load(ckpt / "model.pt", map_location="cpu", weights_only=True)
+        state_dict = torch.load(ckpt / "model.pt", map_location="cpu", weights_only=False)
         stats = load_dataset_stats_from_json(ckpt / "dataset_stats.json")
     else:
         # Legacy format: single .pt file
-        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         # Find dataset_stats.json
         stats_path = None
         for candidate in [
@@ -297,16 +297,14 @@ def predict_action(policy, processor, obs: Dict, task: str,
 def vla_action_to_env_action(vla_action: np.ndarray) -> np.ndarray:
     """Convert VLA action to env-compatible action.
 
-    VLA outputs 13-DoF (pd_joint_pos). The env expects the same 13-DoF.
-    We zero out head joints (indices 8, 9) to prevent head drift,
-    matching eval_policy_client.py behavior.
+    VLA outputs 13-DoF (pd_joint_pos) in the same layout the env expects, so we
+    pass it through unchanged. We deliberately do NOT zero out the head joints:
+    the training data has a clearly non-zero head_tilt trajectory (the robot
+    looks down at the shelf while aligning/grasping), so forcing head_tilt=0 at
+    eval time makes the head camera miss the target object — a train/eval
+    mismatch that tanks the success rate.
     """
-    action = vla_action.astype(np.float32)
-    # Zero out head_pan and head_tilt to prevent head drift during manipulation
-    if len(action) > 9:
-        action[8] = 0  # head_pan
-        action[9] = 0  # head_tilt
-    return action
+    return vla_action.astype(np.float32)
 
 
 # ------------------------------------------------------------------
@@ -328,12 +326,14 @@ def save_video(frames: List[np.ndarray], path: str, fps: int = 30):
 
 def make_env(scene_dir: str, env_name: Optional[str] = None,
              sim_backend: str = "auto", shader: str = "default",
-             robot_uids: str = "ds_fetch_basket"):
+             robot_uids: str = "ds_fetch_basket",
+             disable_init_pose_random: bool = False):
     """Create RoboBenchMart gym environment."""
     sys.path.append(RBM_ROOT)
     import gymnasium as gym
     import mani_skill  # noqa: F401 — registers ManiSkill envs
     import dsynth.envs  # noqa: F401 — registers RoboBenchMart custom envs
+    import dsynth.robots  # noqa: F401 — registers robot agents (ds_fetch_basket, ds_r1)
 
     if env_name is None:
         json_path = os.path.join(scene_dir, "episode_metadata.json")
@@ -361,6 +361,17 @@ def make_env(scene_dir: str, env_name: Optional[str] = None,
         obs_mode="rgb",
         parallel_in_single_scene=False,
     )
+    if disable_init_pose_random:
+        # The training demos were collected with the robot spawned at a fixed
+        # pose right in front of the shelf. The Cont* envs default to
+        # ROBOT_INIT_POSE_RANDOM_ENABLED=True, which spawns the robot ~0.5 m off
+        # and rotated up to 45° — an out-of-distribution start the policy never
+        # saw. Turn it off so eval matches the training initialization.
+        try:
+            env.unwrapped.ROBOT_INIT_POSE_RANDOM_ENABLED = False
+            logger.info("Disabled ROBOT_INIT_POSE_RANDOM_ENABLED to match training init pose")
+        except Exception as e:
+            logger.warning(f"Could not disable init pose randomization: {e}")
     return env
 
 
@@ -371,8 +382,16 @@ def make_env(scene_dir: str, env_name: Optional[str] = None,
 def run_episode(env, policy, processor,
                 coarse_task: str, action_dim: int, max_horizon: int,
                 replan_steps: int = 5, save_video_flag: bool = False,
-                seed: int = 0) -> Dict:
-    """Run one closed-loop episode. Returns dict with success, steps, frames."""
+                seed: int = 0, lock_base: bool = False,
+                lock_rotation: bool = False) -> Dict:
+    """Run one closed-loop episode. Returns dict with success, steps, frames.
+
+    lock_base: if True, zero out base motion (action[11]=forward_vel,
+    action[12]=rotation_vel) so the robot stays in place — useful to isolate
+    and inspect the arm/gripper manipulation behavior on its own.
+    lock_rotation: if True, zero out only base rotation (action[12]) so the
+    robot can still move forward/backward but cannot turn.
+    """
     obs, info = env.reset(seed=seed, options={"reconfigure": True})
 
     # Get language instruction
@@ -402,21 +421,34 @@ def run_episode(env, policy, processor,
             return bool(val.flatten()[0])
         return bool(val)
 
+    def _capture_frame():
+        """Capture one head + third-person frame (called every sim step)."""
+        if not save_video_flag:
+            return
+        try:
+            vla_obs_cur = build_vla_obs(obs, sensor_names)
+            frames_head.append(vla_obs_cur["head_rgb_raw"].copy())
+        except Exception:
+            pass
+        try:
+            rendered = env.render()
+            if rendered is not None:
+                # ManiSkill GPU backend returns a torch tensor; convert to numpy
+                if torch.is_tensor(rendered):
+                    rendered = rendered.detach().cpu().numpy()
+                # ManiSkill render may return (1, H, W, 3) or (H, W, 3)
+                if isinstance(rendered, np.ndarray):
+                    if rendered.ndim == 4:
+                        rendered = rendered[0]
+                    # ensure uint8 RGB for imageio
+                    if rendered.dtype != np.uint8:
+                        rendered = rendered.clip(0, 255).astype(np.uint8)
+                frames_third.append(rendered)
+        except Exception:
+            pass
+
     while step < max_horizon and not _to_bool(done) and not _to_bool(truncated):
         vla_obs = build_vla_obs(obs, sensor_names)
-
-        if save_video_flag:
-            frames_head.append(vla_obs["head_rgb_raw"].copy())
-            try:
-                rendered = env.render()
-                if rendered is not None:
-                    # ManiSkill render may return (1, H, W, 3) or (H, W, 3)
-                    if isinstance(rendered, np.ndarray):
-                        if rendered.ndim == 4:
-                            rendered = rendered[0]
-                    frames_third.append(rendered)
-            except Exception:
-                pass
 
         # Predict action chunk: (chunk_size, action_dim)
         action_chunk = predict_action(
@@ -426,9 +458,31 @@ def run_episode(env, policy, processor,
             action_dim=action_dim,
         )
 
+        # One-time diagnostic: print first VLA action chunk vs current state
+        if step == 0:
+            try:
+                st = vla_obs["state"]
+                st = st["default"] if isinstance(st, dict) else st
+                st = np.asarray(st).flatten()
+                logger.info(f"[DIAG] instruction='{language_instruction}'")
+                logger.info(f"[DIAG] init state (first 15): {np.round(st[:15], 3)}")
+                logger.info(f"[DIAG] VLA action_chunk shape={action_chunk.shape}")
+                logger.info(f"[DIAG] action[0]      : {np.round(action_chunk[0], 3)}")
+                logger.info(f"[DIAG] chunk mean     : {np.round(action_chunk.mean(0), 3)}")
+                logger.info(f"[DIAG] chunk min      : {np.round(action_chunk.min(0), 3)}")
+                logger.info(f"[DIAG] chunk max      : {np.round(action_chunk.max(0), 3)}")
+            except Exception as e:
+                logger.info(f"[DIAG] failed: {e}")
+
         # Execute replan_steps actions from the chunk
         for i in range(min(replan_steps, action_chunk.shape[0])):
+            _capture_frame()  # record one frame per sim step for a smooth video
             env_action = vla_action_to_env_action(action_chunk[i])
+            if lock_base and len(env_action) > 12:
+                env_action[11] = 0.0  # base forward velocity
+                env_action[12] = 0.0  # base rotation velocity
+            elif lock_rotation and len(env_action) > 12:
+                env_action[12] = 0.0  # lock turning, keep forward/backward
             obs, reward, done, truncated, info = env.step(env_action)
             step += 1
 
@@ -488,6 +542,8 @@ def eval_main(cfg: DictConfig) -> None:
     shader = cfg.get("eval_shader", "default")
     save_video_flag = cfg.get("eval_save_video", False)
     video_dir = cfg.get("eval_video_dir", None)
+    lock_base = cfg.get("eval_lock_base", False)
+    lock_rotation = cfg.get("eval_lock_rotation", False)
     device = f"cuda:{gpu_id}"
 
     # Determine action_dim from config (should be 13 for Fetch pd_joint_pos)
@@ -510,7 +566,9 @@ def eval_main(cfg: DictConfig) -> None:
     GlobalHydra.instance().clear()
 
     # Create environment
-    env = make_env(scene_dir, env_name, sim_backend, shader)
+    disable_init_pose_random = cfg.get("eval_disable_init_pose_random", True)
+    env = make_env(scene_dir, env_name, sim_backend, shader,
+                   disable_init_pose_random=disable_init_pose_random)
 
     # Verify action space matches
     env_action_dim = env.action_space.shape[0]
@@ -543,6 +601,8 @@ def eval_main(cfg: DictConfig) -> None:
             replan_steps=replan_steps,
             save_video_flag=save_video_flag,
             seed=seed,
+            lock_base=lock_base,
+            lock_rotation=lock_rotation,
         )
 
         results.append({
