@@ -323,7 +323,7 @@ class VLMPlanner:
     def _call_qwen(self, prompt: str, images: List[np.ndarray], system: str) -> str:
         content = [{"text": prompt}]
         for im in images:                                   # 0, 1, or 2 frames
-            content.insert(0, {"image": f"data:image/jpeg;base64,{self._encode(im)}"})
+            content.append({"image": f"data:image/jpeg;base64,{self._encode(im)}"})
         resp = self.client.call(
             model=self.model, api_key=self.api_key,
             messages=[{"role": "system", "content": [{"text": system}]},
@@ -334,7 +334,7 @@ class VLMPlanner:
     def _call_openai(self, prompt: str, images: List[np.ndarray], system: str) -> str:
         content = [{"type": "text", "text": prompt}]
         for im in images:
-            content.insert(0, {"type": "image_url",
+            content.append({"type": "image_url",
                                "image_url": {"url": f"data:image/jpeg;base64,{self._encode(im)}"}})
         resp = self.client.chat.completions.create(
             model=self.model, temperature=0.1, max_tokens=1024,

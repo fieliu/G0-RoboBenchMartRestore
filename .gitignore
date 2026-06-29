@@ -37,3 +37,12 @@ pretain/*
 restock_sim_plan/*
 outputs/*
 ckpts/*
+*.md
+*.docx
+*.pdf
+vlm_plan_test/*
+
+INTERVIEW_QA.md
+INTERVIEW_QA.md
+.gitignore
+resume.yaml

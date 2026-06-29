@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -c \"import py_compile; py_compile.compile('${CLAUDE_TOOL_OUTPUT_FILE_PATH}', doraise=True)\" 2>&1 || echo '[Hook] 语法检查失败，请检查以上错误'"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "会话即将结束。请检查 CLAUDE.md 的「当前工作状态」节是否需要更新（做了什么、接下来做什么）。如有重要的设计决策、踩坑经验或已知 bug，请写入 Memory 文件。"
+          }
+        ]
+      }
+    ]
+  }
+}
